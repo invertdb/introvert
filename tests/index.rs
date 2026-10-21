@@ -52,6 +52,7 @@ fn postings_hold_exactly_what_was_added() {
         let postings = snapshot.unit(&unit.to_string()).unwrap();
         assert_eq!(postings.count, added.len() as u64, "{unit}");
         let decoded = snapshot.postings.decode(postings.head);
+        assert_eq!(snapshot.postings.first_source(postings.head), Some(added[0].0), "{unit}: first source");
         assert_eq!(decoded.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), *added, "{unit}: decode");
 
         let mut set = SourceSet::new(20_000);

@@ -304,6 +304,17 @@ impl Postings {
         }
     }
 
+    /// The chain's first (smallest) source, from its oldest record's header alone: in either layout, the first
+    /// value after the entry count (a packed record's first source, or a small record's first delta from 0).
+    pub fn first_source(&self, head: u64) -> Option<u32> {
+        let oldest = *self.chain(head).first()?;
+        let mut at = oldest as usize + 8;
+        if varint::read(self.bytes(), &mut at) == 0 {
+            return None;
+        }
+        Some(varint::read(self.bytes(), &mut at) as u32)
+    }
+
     /// Adds every source of the chain to a set.
     pub fn add_sources_to(&self, head: u64, set: &mut SourceSet) {
         let mut cursor = self.cursor(head);
