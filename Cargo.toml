@@ -1,0 +1,12 @@
+[package]
+name = "introvert"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+b-positive = { version = "0.1.0", path = "../b-positive" }
+memmap2 = "0.9.11"
+
+[dev-dependencies]
+rand = "0.10.3"
+tempfile = "3.27.0"
