@@ -2,8 +2,8 @@
 //!
 //! A [`Clause`] requires (must), prefers (should) or excludes (must not) matches and sub-clauses, and may be a
 //! phrase.
-//! A [`Match`] is a unit, or every unit with a prefix or in a range (units are ordered by their encoding, which
-//! preserves their order). [`Searcher::search`] ranks the top k: a disjunction of single units takes the pruned
+//! A [`Match`] is a unit, every unit with a prefix or in a range (units are ordered by their encoding, which
+//! preserves their order), or any of a set of units. [`Searcher::search`] ranks the top k: a disjunction of single units takes the pruned
 //! (MaxScore) path, anything else scores every match. Both return the same results, summed in the same order.
 
 use std::cell::RefCell;
@@ -26,6 +26,8 @@ pub enum Match<U> {
     Prefix(U),
     /// Every unit in the range.
     Range(Bound<U>, Bound<U>),
+    /// Any of these units (e.g. the values of a label a pattern matches, found by the caller).
+    Any(Vec<U>),
 }
 
 impl<U> From<U> for Match<U> {
@@ -62,6 +64,12 @@ impl<U: Codec> Match<U> {
                 key.push(2);
                 bound(&mut key, start);
                 bound(&mut key, end);
+            }
+            Match::Any(units) => {
+                key.push(3);
+                for u in units {
+                    u.encode_nested(&mut key);
+                }
             }
         }
         key
@@ -248,6 +256,7 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
             Match::Unit(u) => self.snapshot.unit(u).into_iter().collect(),
             Match::Prefix(u) => self.snapshot.encoded_prefix(u).take(self.max_expansion).map(|(_, p)| p).collect(),
             Match::Range(start, end) => self.snapshot.encoded_units((start.as_ref(), end.as_ref())).take(self.max_expansion).map(|(_, p)| p).collect(),
+            Match::Any(units) => units.iter().filter_map(|u| self.snapshot.unit(u)).collect(),
         }
     }
 

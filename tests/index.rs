@@ -145,6 +145,7 @@ fn boolean_clauses_and_phrases() {
     c.must_not = vec![Match::Unit(s("whale"))];
     assert_eq!(keys(&c), vec![30]);
     assert_eq!(keys(&Clause::should([Match::Prefix(s("wh"))])), vec![0, 10, 20]);
+    assert_eq!(keys(&Clause::must([Match::Any(vec![s("swims"), s("sea"), s("absent")])])), vec![0, 30]);
     assert_eq!(keys(&Clause::must([Match::Range(Bound::Included(s("sa")), Bound::Excluded(s("t")))])), vec![0, 20, 30]);
 }
 

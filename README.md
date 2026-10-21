@@ -49,7 +49,7 @@ monomorphization, with no special case.
 | **unit** | What a source is inverted into, at positions. |
 | **inverter** | Turns a source into units. |
 | **postings** | A unit's sources, with frequencies and positions. |
-| **match** | What a query covers: a unit, a prefix, or a range of units. |
+| **match** | What a query covers: a unit, a prefix, a range, or any of a set of units. |
 | **clause** | Must, should and must-not matches and sub-clauses, or a phrase of units. |
 | **relevance** | Weight (per unit) and score (per unit in a source). |
 
