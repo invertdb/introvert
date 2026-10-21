@@ -1,19 +1,20 @@
 //! An index of sources keyed by `K` inverted into units of type `U`: a dictionary from unit to its postings (a
 //! b-positive tree, keyed by the units' order-preserving encoding, so the dictionary's order is the units' order),
-//! the postings and positions files, and the sources. One writer adds sources and commits; any number of snapshots
-//! read.
+//! the postings and positions, and the sources. One writer adds sources and commits; any number of snapshots read.
+//!
+//! Storage: the dictionary is a b-positive tree; postings, positions and sources are append-only blobs in a larry
+//! store. A commit appends to the blobs first and commits the dictionary last, recording the blobs' committed
+//! lengths, so a crash anywhere leaves the previous commit (and opening drops whatever lies past it).
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
-use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::path::Path;
+use std::sync::{Mutex, RwLock};
 
 use b_positive::{Db, Durability, ReadTxn};
-use memmap2::Mmap;
+use larry::{Blob, Store, View};
 
 use crate::codec::Codec;
 use crate::inverter::Inverter;
@@ -74,66 +75,65 @@ struct Writing {
 }
 
 struct Published {
-    postings: Arc<Mmap>,
-    positions: Option<Arc<Mmap>>,
+    postings: View,
+    positions: Option<View>,
     sources: Sources,
 }
 
 /// An inverted index of sources keyed by `K` over units `U` (any types with an order-preserving [`Codec`]).
 pub struct Index<K, U> {
     dict: Db,
-    postings_file: File,
-    positions_file: Option<File>,
-    sources_file: File,
+    postings_blob: Blob,
+    positions_blob: Option<Blob>,
+    sources_blob: Blob,
     options: Options,
     writing: Mutex<Writing>,
     published: RwLock<Published>,
     types: PhantomData<fn() -> (K, U)>,
 }
 
-fn open_append(path: &PathBuf) -> io::Result<File> {
-    OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
-}
-
 impl<K: Codec, U: Codec> Index<K, U> {
+    /// Opens (or creates) an index in a directory of its own.
     pub fn open(directory: impl AsRef<Path>, options: Options) -> io::Result<Self> {
-        let directory = directory.as_ref();
-        std::fs::create_dir_all(directory)?;
-        let dict = Db::open(directory.join("units.db"), b_positive::Options { durability: options.durability })?;
-        let postings_file = open_append(&directory.join("postings.dat"))?;
+        Self::open_in(&Store::open(directory)?, options)
+    }
+
+    /// Opens (or creates) an index in a store of its own.
+    pub fn open_in(store: &Store, options: Options) -> io::Result<Self> {
+        let dict = Db::open(store.path("units.db")?, b_positive::Options { durability: options.durability })?;
+        let postings_blob = store.blob("postings.dat")?;
         let meta = dict.begin_read().get(META_KEY).map(|m| Meta::decode(&m)).unwrap_or_default();
 
         // a new index records its options in the postings header; an existing one keeps what it was created with
         let mut options = options;
         if meta.postings_length == 0 {
-            postings_file.set_len(0)?;
-            postings_file.write_all_at(&postings::file_header(options.frequencies, options.positions), 0)?;
+            postings_blob.truncate(0)?;
+            postings_blob.append(&postings::blob_header(options.frequencies, options.positions))?;
         } else {
             let mut header = [0u8; postings::HEADER];
-            postings_file.read_exact_at(&mut header, 0)?;
+            postings_blob.read_at(0, &mut header)?;
             if &header[0..4] != b"IVPT" || header[4] != postings::VERSION {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "not an introvert postings file (or another version)"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "not an introvert postings blob (or another version)"));
             }
             options.frequencies = header[5] & postings::FLAG_FREQUENCIES != 0;
             options.positions = header[5] & postings::FLAG_POSITIONS != 0;
             // anything past the last commit never committed (a crash): drop it
-            postings_file.set_len(meta.postings_length)?;
+            postings_blob.truncate(meta.postings_length)?;
         }
-        let postings_length = postings_file.metadata()?.len();
-        let positions_file = if options.positions {
-            let file = open_append(&directory.join("positions.dat"))?;
-            file.set_len(meta.positions_length)?;
-            Some(file)
+        let postings_length = postings_blob.len();
+        let positions_blob = if options.positions {
+            let blob = store.blob("positions.dat")?;
+            blob.truncate(meta.positions_length)?;
+            Some(blob)
         } else {
             None
         };
-        let sources_file = open_append(&directory.join("sources.dat"))?;
-        sources_file.set_len(meta.sources_length)?;
+        let sources_blob = store.blob("sources.dat")?;
+        sources_blob.truncate(meta.sources_length)?;
 
-        // the sources, from their file
+        // the sources, from their blob
         let mut sources = Sources::default();
-        let mut bytes = vec![0u8; meta.sources_length as usize];
-        sources_file.read_exact_at(&mut bytes, 0)?;
+        let bytes = sources_blob.read_all()?;
         let mut at = 0;
         while at < bytes.len() {
             let key_length = varint::read(&bytes, &mut at) as usize;
@@ -145,12 +145,12 @@ impl<K: Codec, U: Codec> Index<K, U> {
         sources.truncate(meta.sources);
 
         let meta = Meta { postings_length, positions_length: meta.positions_length, sources_length: meta.sources_length, sources: sources.count() };
-        let published = Published { postings: map(&postings_file)?, positions: positions_file.as_ref().map(map).transpose()?, sources: sources.clone() };
+        let published = Published { postings: postings_blob.view()?, positions: positions_blob.as_ref().map(Blob::view).transpose()?, sources: sources.clone() };
         Ok(Index {
             dict,
-            postings_file,
-            positions_file,
-            sources_file,
+            postings_blob,
+            positions_blob,
+            sources_blob,
             options,
             writing: Mutex::new(Writing { buffers: HashMap::new(), buffered: 0, positions: Vec::new(), sources_bytes: Vec::new(), sources, meta }),
             published: RwLock::new(published),
@@ -222,9 +222,9 @@ impl<K: Codec, U: Codec> Index<K, U> {
         w.buffered + w.positions.len() + w.sources_bytes.len()
     }
 
-    /// Makes everything added since the last commit durable and visible to new snapshots. The data files are
-    /// written first and the dictionary (with the lengths that are now valid) commits last: a crash anywhere
-    /// leaves the previous commit.
+    /// Makes everything added since the last commit durable and visible to new snapshots. The blobs are appended
+    /// first and the dictionary (with the lengths that are now valid) commits last: a crash anywhere leaves the
+    /// previous commit.
     pub fn commit(&self) -> io::Result<()> {
         let mut w = self.writing.lock().unwrap();
         let mut units: Vec<(Vec<u8>, Buffer)> = w.buffers.drain().collect();
@@ -245,20 +245,21 @@ impl<K: Codec, U: Codec> Index<K, U> {
             txn.put(unit, &value)?;
         }
 
-        self.postings_file.write_all_at(&records, w.meta.postings_length)?;
+        debug_assert_eq!(self.postings_blob.len(), w.meta.postings_length);
+        self.postings_blob.append(&records)?;
         w.meta.postings_length += records.len() as u64;
-        if let Some(file) = &self.positions_file {
-            file.write_all_at(&w.positions, w.meta.positions_length)?;
+        if let Some(blob) = &self.positions_blob {
+            blob.append(&w.positions)?;
             w.meta.positions_length += w.positions.len() as u64;
         }
-        self.sources_file.write_all_at(&w.sources_bytes, w.meta.sources_length)?;
+        self.sources_blob.append(&w.sources_bytes)?;
         w.meta.sources_length += w.sources_bytes.len() as u64;
         if self.options.durability == Durability::Full {
-            self.postings_file.sync_data()?;
-            if let Some(file) = &self.positions_file {
-                file.sync_data()?;
+            self.postings_blob.sync()?;
+            if let Some(blob) = &self.positions_blob {
+                blob.sync()?;
             }
-            self.sources_file.sync_data()?;
+            self.sources_blob.sync()?;
         }
         w.meta.sources = w.sources.count();
         txn.put(META_KEY, &w.meta.encode())?;
@@ -268,8 +269,8 @@ impl<K: Codec, U: Codec> Index<K, U> {
         w.sources_bytes.clear();
         w.buffered = 0;
         let published = Published {
-            postings: map(&self.postings_file)?,
-            positions: self.positions_file.as_ref().map(map).transpose()?,
+            postings: self.postings_blob.view()?,
+            positions: self.positions_blob.as_ref().map(Blob::view).transpose()?,
             sources: w.sources.clone(),
         };
         *self.published.write().unwrap() = published;
@@ -289,14 +290,6 @@ impl<K: Codec, U: Codec> Index<K, U> {
     }
 }
 
-fn map(file: &File) -> io::Result<Arc<Mmap>> {
-    // a zero-length file can't be mapped; postings always have their header, other files may be empty
-    if file.metadata()?.len() == 0 {
-        return Ok(Arc::new(memmap2::MmapOptions::new().len(0).map_anon()?.make_read_only()?));
-    }
-    Ok(Arc::new(unsafe { Mmap::map(file)? }))
-}
-
 /// A unit's postings: where its chain starts, and how many sources it lists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnitPostings {
@@ -314,7 +307,7 @@ impl UnitPostings {
 pub struct Snapshot<K, U> {
     dict: ReadTxn,
     pub postings: Postings,
-    positions: Option<Arc<Mmap>>,
+    positions: Option<View>,
     pub(crate) sources: Sources,
     types: PhantomData<fn() -> (K, U)>,
 }

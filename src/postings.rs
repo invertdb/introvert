@@ -1,6 +1,6 @@
 //! Postings: which sources a unit occurs in, how often, and where its positions are.
 //!
-//! The postings file is append-only: an 8-byte header ("IVPT", version, flags), then records. Each record holds a
+//! The postings blob is append-only: an 8-byte header ("IVPT", version, flags), then records. Each record holds a
 //! unit's entries from one flush and points at the unit's previous record (a chain, newest first):
 //!
 //! ```text
@@ -26,9 +26,7 @@
 //! needs. Impacts follow Anh and Moffat (2006), here as a Pareto set rather than quantized; per-block maxima in the
 //! block index follow the block-max indexes of Ding and Suel (2011).
 
-use std::sync::Arc;
 
-use memmap2::Mmap;
 
 use crate::bitpack;
 use crate::sourceset::SourceSet;
@@ -42,7 +40,7 @@ pub const VERSION: u8 = 1;
 pub const FLAG_FREQUENCIES: u8 = 1;
 pub const FLAG_POSITIONS: u8 = 2;
 
-pub fn file_header(frequencies: bool, positions: bool) -> [u8; HEADER] {
+pub fn blob_header(frequencies: bool, positions: bool) -> [u8; HEADER] {
     let flags = if frequencies { FLAG_FREQUENCIES } else { 0 } | if positions { FLAG_POSITIONS } else { 0 };
     [b'I', b'V', b'P', b'T', VERSION, flags, 0, 0]
 }
@@ -191,10 +189,10 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
     out.extend_from_slice(&[0; bitpack::PADDING]);
 }
 
-/// The postings file, mapped: reading records and cursors over chains.
+/// The postings blob, through a view: reading records and cursors over chains.
 #[derive(Clone)]
 pub struct Postings {
-    pub(crate) map: Arc<Mmap>,
+    pub(crate) map: larry::View,
     pub frequencies: bool,
     pub positions: bool,
 }

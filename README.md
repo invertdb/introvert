@@ -65,10 +65,13 @@ Each technique is cited where it is used and listed under [References](#referenc
     source), which cursors binary-search to skip.
   - Each record carries Pareto (frequency, length) impacts that bound scores (after Anh and Moffat,
     2006).
-  - Positions live in their own file, decoded only for phrases.
+  - Positions live in their own blob, decoded only for phrases.
 - **Sources:** an ordinal per source with its key and length, in shared chunks; a snapshot copies
   nothing.
-- **Commits are atomic:** data files are written first, then the dictionary commits with the
+- **Storage:** the dictionary is a [b-positive](https://github.com/invertdb/b-positive) tree;
+  postings, positions and sources are append-only blobs in a [larry](https://github.com/invertdb/larry)
+  store (`Index::open_in`), read through memory-mapped views. introvert does no file I/O of its own.
+- **Commits are atomic:** blobs are appended first, then the dictionary commits with the
   lengths that are now valid. A crash anywhere leaves the previous commit, and anything past it is
   discarded on open.
 - **Search:**
@@ -116,4 +119,4 @@ Each technique is cited where it is used and listed under [References](#referenc
   *Information Processing & Management* 31(6).
 - Zobel, J., and Moffat, A. (2006). Inverted files for text search engines. *ACM Computing Surveys* 38(2).
 
-Repos are checked out side by side (`../b-positive`).
+Repos are checked out side by side (`../b-positive`, `../larry`).

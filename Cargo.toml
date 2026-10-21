@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 b-positive = { version = "0.1.0", path = "../b-positive" }
-memmap2 = "0.9.11"
+larry = { version = "0.1.0", path = "../larry" }
 unicode-general-category = "1.1.0"
 
 [dev-dependencies]

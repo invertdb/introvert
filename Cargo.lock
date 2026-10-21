@@ -84,10 +84,17 @@ name = "introvert"
 version = "0.1.0"
 dependencies = [
  "b-positive",
- "memmap2",
+ "larry",
  "rand",
  "tempfile",
  "unicode-general-category",
+]
+
+[[package]]
+name = "larry"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
 ]
 
 [[package]]
