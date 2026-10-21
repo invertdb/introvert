@@ -113,7 +113,7 @@ fn pruned_searches_return_what_scoring_everything_returns() {
     let snapshot = built.index.snapshot();
     let mut rng = StdRng::seed_from_u64(5);
     pruned_equals_exhaustive(&built, &snapshot, &Bm25::default(), &mut rng);
-    pruned_equals_exhaustive(&built, &snapshot, &Bm25 { quantize_lengths: true, ..Bm25::default() }, &mut rng);
+    pruned_equals_exhaustive(&built, &snapshot, &Bm25 { k1: 2.0, b: 0.3 }, &mut rng);
     pruned_equals_exhaustive(&built, &snapshot, &TfIdf, &mut rng);
 }
 

@@ -20,35 +20,17 @@ pub trait Relevance: Send + Sync {
     fn score(&self, weight: f64, unit_frequency: u32, norm: Self::Norm) -> f64;
 }
 
-/// Okapi BM25 (as Lucene's BM25Similarity): frequency saturates by `k1`, normalized by length by `b`.
+/// BM25: a unit's frequency saturates by `k1`, and a source's length normalizes by `b` (0: not at all; 1: fully,
+/// against the average length).
 #[derive(Clone, Copy, Debug)]
 pub struct Bm25 {
     pub k1: f64,
     pub b: f64,
-    /// Lengths rounded to Lucene's one-byte norms.
-    pub quantize_lengths: bool,
 }
 
 impl Default for Bm25 {
     fn default() -> Self {
-        Bm25 { k1: 1.2, b: 0.75, quantize_lengths: false }
-    }
-}
-
-impl Bm25 {
-    /// A length as Lucene's SmallFloat.intToByte4 then byte4ToInt keep it: exact to 24, then 4 significant bits.
-    pub fn quantize(length: u32) -> u32 {
-        const FREE: u32 = 24;
-        if length < FREE {
-            return length;
-        }
-        let i = (length - FREE) as u64;
-        let bits = 64 - i.leading_zeros();
-        if bits < 4 {
-            return FREE + i as u32;
-        }
-        let shift = bits - 4;
-        FREE + ((((i >> shift) & 0x07) | 0x08) << shift) as u32
+        Bm25 { k1: 1.2, b: 0.75 }
     }
 }
 
@@ -61,8 +43,7 @@ impl Relevance for Bm25 {
 
     #[inline]
     fn norm(&self, source_length: u32, average_length: f64) -> f64 {
-        let length = if self.quantize_lengths { Self::quantize(source_length) } else { source_length };
-        self.k1 * (1.0 - self.b + self.b * length as f64 / average_length)
+        self.k1 * (1.0 - self.b + self.b * source_length as f64 / average_length)
     }
 
     #[inline]

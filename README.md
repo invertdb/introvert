@@ -78,7 +78,7 @@ monomorphization, with no special case.
 `tests/index.rs`:
 - **Postings:** checked against exactly what was added (decode, source sets, cursor `advance`
   to random targets, positions).
-- **Pruning:** pruned equals exhaustive on 1,350 random queries (BM25, quantized BM25, TF-IDF;
+- **Pruning:** pruned equals exhaustive on 1,350 random queries (BM25 at two tunings, TF-IDF;
   top 1, 10, 100).
 - **Queries:** booleans, phrases, prefixes and ranges.
 - **Typed indexes:** `(String, u16)` keys over a struct unit (signed ranges across zero), and
