@@ -1,19 +1,23 @@
 //! How well a source matches a unit, from how often the unit occurs in it and how many sources contain the unit.
 //!
+//! A searcher is generic over its relevance, so scoring compiles inline. A source's length enters through
+//! [`Relevance::Norm`], computed once per source and shared by every unit scored against it.
+//!
 //! Top-k pruning bounds scores from postings maxima, so [`Relevance::score`] must not decrease as the unit frequency
 //! grows, nor increase as the source length grows.
 
 pub trait Relevance: Send + Sync {
+    /// What a source's length contributes to its scores.
+    type Norm: Copy;
+
     /// What matching the unit is worth, given that `source_frequency` of `source_count` sources contain it.
     fn weight(&self, source_frequency: u64, source_count: u64) -> f64;
 
-    /// A source's score for a unit of the given weight occurring `unit_frequency` times in it (lengths in units).
-    fn score(&self, weight: f64, unit_frequency: u32, source_length: u32, average_length: f64) -> f64;
+    /// A source's norm, from its length in units and the average length.
+    fn norm(&self, source_length: u32, average_length: f64) -> Self::Norm;
 
-    /// As [`Bm25`], if this is BM25 with exact lengths: lets the searcher score it inline.
-    fn as_bm25(&self) -> Option<&Bm25> {
-        None
-    }
+    /// A source's score for a unit of the given weight occurring `unit_frequency` times in it.
+    fn score(&self, weight: f64, unit_frequency: u32, norm: Self::Norm) -> f64;
 }
 
 /// Okapi BM25 (as Lucene's BM25Similarity): frequency saturates by `k1`, normalized by length by `b`.
@@ -46,27 +50,25 @@ impl Bm25 {
         let shift = bits - 4;
         FREE + ((((i >> shift) & 0x07) | 0x08) << shift) as u32
     }
-
-    #[inline]
-    pub fn norm(&self, length: u32, average_length: f64) -> f64 {
-        self.k1 * (1.0 - self.b + self.b * length as f64 / average_length)
-    }
 }
 
 impl Relevance for Bm25 {
+    type Norm = f64;
+
     fn weight(&self, source_frequency: u64, source_count: u64) -> f64 {
         (1.0 + (source_count as f64 - source_frequency as f64 + 0.5) / (source_frequency as f64 + 0.5)).ln()
     }
 
     #[inline]
-    fn score(&self, weight: f64, unit_frequency: u32, source_length: u32, average_length: f64) -> f64 {
+    fn norm(&self, source_length: u32, average_length: f64) -> f64 {
         let length = if self.quantize_lengths { Self::quantize(source_length) } else { source_length };
-        let f = unit_frequency as f64;
-        weight * f / (f + self.norm(length, average_length))
+        self.k1 * (1.0 - self.b + self.b * length as f64 / average_length)
     }
 
-    fn as_bm25(&self) -> Option<&Bm25> {
-        if self.quantize_lengths { None } else { Some(self) }
+    #[inline]
+    fn score(&self, weight: f64, unit_frequency: u32, norm: f64) -> f64 {
+        let f = unit_frequency as f64;
+        weight * f / (f + norm)
     }
 }
 
@@ -75,11 +77,17 @@ impl Relevance for Bm25 {
 pub struct TfIdf;
 
 impl Relevance for TfIdf {
+    type Norm = ();
+
     fn weight(&self, source_frequency: u64, source_count: u64) -> f64 {
         (1.0 + source_count as f64 / source_frequency as f64).ln()
     }
 
-    fn score(&self, weight: f64, unit_frequency: u32, _source_length: u32, _average_length: f64) -> f64 {
+    #[inline]
+    fn norm(&self, _source_length: u32, _average_length: f64) {}
+
+    #[inline]
+    fn score(&self, weight: f64, unit_frequency: u32, _norm: ()) -> f64 {
         weight * (1.0 + (unit_frequency as f64).ln())
     }
 }

@@ -5,18 +5,44 @@ series, the cells of a place, the landmarks of a song), ranked with BM25 or TF-I
 reimplemented from bsharptree's `simpleindex`, on [b-positive](https://github.com/invertdb/b-positive).
 
 ```rust
-let index = introvert::Index::open("idx", Default::default())?;
-index.add(b"doc1", [(&b"white"[..], 0), (&b"whale"[..], 1)]);
+use introvert::{Bm25, Clause, Index, Searcher, Term, Words};
+
+// any source type S, any unit type U (each with an order-preserving Codec)
+let index: Index<u32, String> = Index::open("idx", Default::default())?;
+index.invert(&1, "the white whale", &Words::default());   // an Inverter<D> turns a D into units
 index.commit()?;
-let snapshot = index.snapshot();                         // any thread; unaffected by later commits
-let bm25 = introvert::Bm25::default();
-let results = introvert::Searcher::new(&snapshot, &bm25).search(&introvert::Clause::should([b"whale".to_vec()]), 10);
+
+let snapshot = index.snapshot();                           // any thread; unaffected by later commits
+let bm25 = Bm25::default();
+let searcher = Searcher::new(&snapshot, &bm25);            // generic over the relevance: scoring compiles inline
+let hits = searcher.search(&Clause::should(["whale".to_string()]), 10).top;    // Hit<u32>: hits[0].source == 1
+let wh = searcher.search(&Clause::should([Term::Prefix("wh".to_string())]), 10);
 ```
+
+## Generics
+
+**Everything is typed:**
+- `Index<S, U>`, `Snapshot<S, U>`, `Clause<U>`, `Term<U>`, `Hit<S>`, and `Searcher<S, U, R>` with
+  `R: Relevance`.
+- An `Inverter<D>` turns a document of any type into units.
+- A source key is any `S: Codec` and a unit any `U: Codec`. Bytes are only the storage format.
+
+**`Codec` is order-preserving**, so the dictionary's order is the units' order:
+- A `Term::Range` of typed units is a range scan. Examples: temperatures across zero, times,
+  geo cells.
+- A `Term::Prefix` of a tuple (or a struct encoded as one) stays within its leading elements, e.g.
+  `(field, "whal")`.
+- Provided codecs: strings, byte vectors, all integer widths (signed sorted correctly), `f64`
+  (totally ordered), `bool`, `char`, `()`, and tuples of up to four. A struct implements `Codec`
+  by delegating to its fields.
+
+**`Relevance` is a type parameter**, not a trait object. A source's length enters once per
+candidate through `Relevance::Norm`, so BM25's per-candidate norm is shared across units by
+monomorphization, with no special case.
 
 ## Design
 
-- **Dictionary:** a b-positive tree from unit (bytes, in byte order: a prefix is a range) to its
-  postings head and count. Its snapshots keep readers independent of the writer, with no draining
+- **Dictionary:** a b-positive tree from each unit's encoding to its postings head and count. Its snapshots keep readers independent of the writer, with no draining
   or generation swapping.
 - **Postings:** append-only records chained per unit.
   - Records over 128 entries bit-pack 128-entry blocks behind a fixed-width block index (last
@@ -33,7 +59,7 @@ let results = introvert::Searcher::new(&snapshot, &bm25).search(&introvert::Clau
     early exit on bitsets.
   - Top-k for plain disjunctions by MaxScore, with window skipping on block maxima and inline
     BM25. It is exactly equal to scoring every match (tested).
-  - Unit expansion is pluggable (e.g. `prefix*`).
+  - Prefix and range terms expand to the units they cover, up to a limit.
 
 ## Tests
 
@@ -42,7 +68,10 @@ let results = introvert::Searcher::new(&snapshot, &bm25).search(&introvert::Clau
   to random targets, positions).
 - **Pruning:** pruned equals exhaustive on 1,350 random queries (BM25, quantized BM25, TF-IDF;
   top 1, 10, 100).
-- **Queries:** booleans and phrases.
+- **Queries:** booleans, phrases, prefixes and ranges.
+- **Typed indexes:** `(String, u16)` keys over a struct unit (signed ranges across zero), and
+  `(field, term)` tuple units (prefixes within a field).
+- **Codecs:** order preserved and round trips for every provided codec.
 - **Recovery:** snapshot isolation, and recovery from a crash mid-commit.
 
 Repos are checked out side by side (`../b-positive`).
