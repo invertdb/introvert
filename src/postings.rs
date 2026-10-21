@@ -222,8 +222,11 @@ impl Postings {
         u64::from_le_bytes(self.bytes()[record as usize..record as usize + 8].try_into().unwrap())
     }
 
-    /// The records of a chain, oldest first.
-    fn chain(&self, head: u64) -> Vec<u64> {
+    /// The records of a chain, oldest first (no allocation for the common chain of one record).
+    fn chain(&self, head: u64) -> Records {
+        if head != NO_RECORD && self.previous(head) == NO_RECORD {
+            return Records::One(head);
+        }
         let mut records = Vec::new();
         let mut record = head;
         while record != NO_RECORD {
@@ -231,7 +234,7 @@ impl Postings {
             record = self.previous(record);
         }
         records.reverse();
-        records
+        Records::Many(records)
     }
 
     fn packed(&self, mut at: usize, count: usize) -> Packed {
@@ -307,7 +310,7 @@ impl Postings {
     /// The chain's first (smallest) source, from its oldest record's header alone: in either layout, the first
     /// value after the entry count (a packed record's first source, or a small record's first delta from 0).
     pub fn first_source(&self, head: u64) -> Option<u32> {
-        let oldest = *self.chain(head).first()?;
+        let oldest = self.chain(head).first()?;
         let mut at = oldest as usize + 8;
         if varint::read(self.bytes(), &mut at) == 0 {
             return None;
@@ -355,6 +358,35 @@ impl Postings {
     }
 }
 
+/// A chain's records, oldest first.
+enum Records {
+    One(u64),
+    Many(Vec<u64>),
+}
+
+impl Records {
+    fn len(&self) -> usize {
+        match self {
+            Records::One(_) => 1,
+            Records::Many(r) => r.len(),
+        }
+    }
+
+    fn get(&self, i: usize) -> u64 {
+        match self {
+            Records::One(r) => *r,
+            Records::Many(r) => r[i],
+        }
+    }
+
+    fn first(&self) -> Option<u64> {
+        match self {
+            Records::One(r) => Some(*r),
+            Records::Many(r) => r.first().copied(),
+        }
+    }
+}
+
 pub const NOT_STARTED: u32 = u32::MAX - 1;
 const BEFORE: usize = usize::MAX; // a block's entry index before its first entry
 pub const NO_MORE: u32 = u32::MAX;
@@ -363,7 +395,7 @@ pub const NO_MORE: u32 = u32::MAX;
 /// binary-searches the block index.
 pub struct Cursor<'a> {
     postings: &'a Postings,
-    records: Vec<u64>,
+    records: Records,
     record: usize,
     packed: bool,
     view: Packed,
@@ -577,7 +609,7 @@ impl<'a> Cursor<'a> {
             self.source = NO_MORE;
             return false;
         }
-        let mut at = self.records[self.record] as usize + 8;
+        let mut at = self.records.get(self.record) as usize + 8;
         let count = varint::read(self.postings.bytes(), &mut at) as usize;
         self.source = NOT_STARTED; // deltas restart in each record
         self.running_offset = 0;

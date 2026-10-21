@@ -49,7 +49,7 @@ monomorphization, with no special case.
 | **unit** | What a source is inverted into, at positions. |
 | **inverter** | Turns a source into units. |
 | **postings** | A unit's sources, with frequencies and positions. |
-| **match** | What a query covers: a unit, a prefix, a range, or any of a set of units. |
+| **match** | What a query covers: a unit, a prefix, a range, or any of a set of units (or of their postings, already looked up). |
 | **clause** | Must, should and must-not matches and sub-clauses, or a phrase of units. |
 | **relevance** | Weight (per unit) and score (per unit in a source). |
 
@@ -73,7 +73,8 @@ Each technique is cited where it is used and listed under [References](#referenc
   discarded on open.
 - **Search:**
   - Boolean clauses: must, should, must-not, phrases, sub-clauses, evaluated smallest first with
-    early exit on bitsets.
+    early exit on bitsets. A unit much larger than what's left is intersected, or excluded, by
+    advancing its cursor to each remaining source, so its block index skips what isn't needed.
   - Top-k for plain disjunctions by MaxScore (Turtle and Flood, 1995), with window skipping on
     block maxima (Ding and Suel, 2011). It is exactly equal to scoring every match (tested).
   - Relevance: BM25 (Robertson et al., 1994; Robertson and Zaragoza, 2009) and TF-IDF (Spärck Jones,

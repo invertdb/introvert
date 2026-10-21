@@ -301,3 +301,26 @@ fn alignment_finds_where_a_query_lines_up() {
         assert!(found[0].count >= 40 && (found.len() < 2 || found[1].count < 10), "{found:?}");
     }
 }
+
+#[test]
+fn intersecting_a_small_set_with_a_large_one() {
+    // the larger unit's sources are kept by advancing its cursor to each of the smaller set's
+    let built = build(12);
+    let snapshot = built.index.snapshot();
+    let relevance = TfIdf;
+    let searcher = Searcher::new(&snapshot, &relevance);
+    for (rare, common) in [("u2999", "u0"), ("u1500", "u1"), ("u40", "u0"), ("u2999", "u2998")] {
+        let have = |u: &str| built.expected.get(u).map(|e| e.iter().map(|x| x.0).collect::<std::collections::BTreeSet<u32>>()).unwrap_or_default();
+        let expected: Vec<u32> = have(rare).intersection(&have(common)).copied().collect();
+        let found: Vec<u32> = searcher.matching(&Clause::must([rare.to_string(), common.to_string()])).iter().collect();
+        assert_eq!(found, expected, "{rare} and {common}");
+        let found: Vec<u32> = searcher.matching(&Clause::must([Match::Unit(rare.to_string()), Match::Any(vec![common.to_string(), "u3".to_string()])])).iter().collect();
+        let either: std::collections::BTreeSet<u32> = have(common).union(&have("u3")).copied().collect();
+        assert_eq!(found, have(rare).intersection(&either).copied().collect::<Vec<_>>(), "{rare} and any of {common}, u3");
+        // and excluding the common one: its cursor removes sources from the rare one's
+        let mut c = Clause::must([rare.to_string()]);
+        c.must_not = vec![Match::Unit(common.to_string())];
+        let found: Vec<u32> = searcher.matching(&c).iter().collect();
+        assert_eq!(found, have(rare).difference(&have(common)).copied().collect::<Vec<_>>(), "{rare} without {common}");
+    }
+}

@@ -15,8 +15,19 @@ impl SourceSet {
 
     pub fn all(capacity: u32) -> SourceSet {
         let mut set = SourceSet::new(capacity);
-        for source in 0..capacity {
-            set.insert(source);
+        for (b, block) in set.blocks.iter_mut().enumerate() {
+            let mut words = Box::new([u64::MAX; BLOCK_WORDS]);
+            // clear the bits past the capacity, in the last block
+            for (w, word) in words.iter_mut().enumerate() {
+                let first = ((b * BLOCK_WORDS + w) * 64) as u64;
+                let end = capacity as u64;
+                if first >= end {
+                    *word = 0;
+                } else if end - first < 64 {
+                    *word = (1u64 << (end - first)) - 1;
+                }
+            }
+            *block = Some(words);
         }
         set
     }
@@ -107,5 +118,19 @@ impl Iterator for BitIter {
         let bit = self.0.trailing_zeros();
         self.0 &= self.0 - 1;
         Some(bit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_holds_exactly_the_capacity() {
+        for capacity in [0u32, 1, 63, 64, 65, 65_536, 65_537, 200_003] {
+            let set = SourceSet::all(capacity);
+            assert_eq!(set.len(), capacity as usize, "{capacity}");
+            assert_eq!(set.iter().last(), capacity.checked_sub(1), "{capacity}");
+        }
     }
 }

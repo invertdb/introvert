@@ -28,6 +28,8 @@ pub enum Match<U> {
     Range(Bound<U>, Bound<U>),
     /// Any of these units (e.g. the values of a label a pattern matches, found by the caller).
     Any(Vec<U>),
+    /// Any of these units, already looked up (e.g. from a table of a label's values the caller keeps).
+    Postings(Vec<UnitPostings>),
 }
 
 impl<U> From<U> for Match<U> {
@@ -69,6 +71,12 @@ impl<U: Codec> Match<U> {
                 key.push(3);
                 for u in units {
                     u.encode_nested(&mut key);
+                }
+            }
+            Match::Postings(parts) => {
+                key.push(4);
+                for p in parts {
+                    key.extend_from_slice(&p.head.to_le_bytes());
                 }
             }
         }
@@ -159,6 +167,9 @@ pub struct Alignment<K> {
 }
 
 pub const DEFAULT_MAX_EXPANSION: usize = 1024;
+
+/// A match of at most this many units may be intersected (or excluded) by advancing a cursor per unit.
+const CURSOR_PARTS: usize = 16;
 
 /// Searches a snapshot of an index of sources `K` over units `U`, ranking by relevance `R`.
 pub struct Searcher<'s, K, U, R> {
@@ -269,6 +280,7 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
             Match::Prefix(u) => self.snapshot.encoded_prefix(u).take(self.max_expansion).map(|(_, p)| p).collect(),
             Match::Range(start, end) => self.snapshot.encoded_units((start.as_ref(), end.as_ref())).take(self.max_expansion).map(|(_, p)| p).collect(),
             Match::Any(units) => units.iter().filter_map(|u| self.snapshot.unit(u)).collect(),
+            Match::Postings(parts) => parts.clone(),
         }
     }
 
@@ -638,10 +650,29 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
             }
             let mut acc: Option<SourceSet> = None;
             for unit_match in musts {
-                let set = self.set(unit_match);
                 match &mut acc {
-                    None => acc = Some(set),
-                    Some(a) => a.and(&set),
+                    None => acc = Some(self.set(unit_match)),
+                    Some(a) => {
+                        // much larger than what's left: keep the sources it has, advancing its cursors to each (they
+                        // skip whole blocks); else build its set and intersect
+                        let left = a.len() as u64;
+                        let snapshot = self.searcher.snapshot;
+                        let data = self.data(unit_match);
+                        if data.entries.is_none() && data.parts.len() <= CURSOR_PARTS && data.estimate > 8 * left {
+                            let postings = &snapshot.postings;
+                            let mut cursors: Vec<_> = data.parts.iter().map(|p| postings.cursor(p.head)).collect();
+                            let mut kept = SourceSet::new(n);
+                            for source in a.iter() {
+                                if cursors.iter_mut().any(|c| c.advance(source) && c.source == source) {
+                                    kept.insert(source);
+                                }
+                            }
+                            *a = kept;
+                        } else {
+                            let set = self.set(unit_match);
+                            a.and(&set);
+                        }
+                    }
                 }
                 if acc.as_ref().unwrap().is_empty() {
                     return acc.unwrap();
@@ -672,6 +703,20 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
             result = SourceSet::all(n);
         }
         for unit_match in &clause.must_not {
+            // much larger than what's left: remove the sources it has by advancing its cursors to each
+            let left = result.len() as u64;
+            let snapshot = self.searcher.snapshot;
+            let data = self.data(unit_match);
+            if data.entries.is_none() && data.parts.len() <= CURSOR_PARTS && data.estimate > 8 * left {
+                let mut cursors: Vec<_> = data.parts.iter().map(|p| snapshot.postings.cursor(p.head)).collect();
+                let present: Vec<u32> = result.iter().collect();
+                for source in present {
+                    if cursors.iter_mut().any(|c| c.advance(source) && c.source == source) {
+                        result.remove(source);
+                    }
+                }
+                continue;
+            }
             let set = self.set(unit_match);
             result.and_not(&set);
         }
