@@ -509,9 +509,13 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
     }
 
     fn set(&mut self, unit_match: &Match<U>) -> SourceSet {
-        let mut set = SourceSet::new(self.searcher.snapshot.source_count());
-        for e in self.entries(unit_match).iter() {
-            set.insert(e.0);
+        let snapshot = self.searcher.snapshot;
+        let mut set = SourceSet::new(snapshot.source_count());
+        let data = self.data(unit_match);
+        match &data.entries {
+            Some(entries) => entries.iter().for_each(|e| set.insert(e.0)),
+            // only the sources are needed: read them straight into the set, without decoding entries
+            None => data.parts.iter().for_each(|part| snapshot.postings.add_sources_to(part.head, &mut set)),
         }
         set
     }
