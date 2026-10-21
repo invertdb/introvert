@@ -39,7 +39,7 @@ fn is_letter_or_digit(c: char) -> bool {
     matches!(get_general_category(c), G::UppercaseLetter | G::LowercaseLetter | G::TitlecaseLetter | G::ModifierLetter | G::OtherLetter | G::DecimalNumber)
 }
 
-/// One character lower-cased, never expanding (as .NET's ToLowerInvariant).
+/// One character lower-cased, never expanding into several (a character with no single lower case stays).
 #[inline]
 fn lower(c: char) -> char {
     if c.is_ascii() {
@@ -95,7 +95,7 @@ mod tests {
         let words = |t: &str| Words::default().units(t).into_iter().map(|u| u.0).collect::<Vec<_>>();
         assert_eq!(words("The White-Whale's 2nd ÉTÉ!"), vec!["the", "white", "whale", "s", "2nd", "été"]);
         assert_eq!(words(&"x".repeat(40))[0].len(), 32);
-        // other numbers, letter numbers and marks split words, as .NET's IsLetterOrDigit
+        // only letters and decimal digits make words: other numbers, letter numbers and marks split them
         assert_eq!(words("x² café\u{301} Ⅻ"), vec!["x", "café"]);
     }
 }

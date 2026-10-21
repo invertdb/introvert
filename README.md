@@ -2,7 +2,7 @@
 
 A generic inverted index: any source type inverted into any unit type, ranked with BM25 or TF-IDF. Examples: the
 words of a text, the labels of a time series, the cells of a place, the landmarks of a song. The engine of
-invertdb, reimplemented from bsharptree's `simpleindex`, on [b-positive](https://github.com/invertdb/b-positive).
+invertdb, on [b-positive](https://github.com/invertdb/b-positive).
 
 ```rust
 use introvert::{Bm25, Clause, Index, Match, Searcher, Words};
