@@ -306,7 +306,8 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
         highest
     }
 
-    /// Top-k for a disjunction of units by MaxScore (Turtle and Flood). Units ordered by the most any source can
+    /// Top-k for a disjunction of units by MaxScore (Turtle and Flood, 1995, "Query evaluation: strategies and
+    /// optimizations"), with block-max windows (Ding and Suel, 2011). Units ordered by the most any source can
     /// score for them; once the k-th best reaches the sum of the smallest bounds, those units can't put a source in
     /// the top alone: candidates come only from the others ("essential"), and the rest are advanced to each
     /// candidate only while it can still make it. Windows where the essential units' block maxima can't beat the

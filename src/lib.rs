@@ -10,6 +10,12 @@
 //! The dictionary is a [b-positive](https://github.com/invertdb/b-positive) tree from unit to its postings, whose
 //! snapshots make readers independent of the writer. Postings are bit-packed 128-entry blocks behind a block index
 //! for skipping, with impacts that bound scores; searches rank the top k with MaxScore over them.
+//!
+//! Theory: inverted files as surveyed by Zobel and Moffat (2006); relevance by BM25 (Robertson et al., 1994;
+//! Robertson and Zaragoza, 2009) or TF-IDF (Spärck Jones, 1972; Salton and Buckley, 1988); postings compressed by
+//! frame of reference (Goldstein, Ramakrishnan and Shaft, 1998); top-k by MaxScore (Turtle and Flood, 1995) with
+//! pre-computed impacts (Anh and Moffat, 2006) and block maxima (Ding and Suel, 2011); units ordered by normalized
+//! keys (Graefe, 2011). Full references are in the README.
 
 pub mod bitpack;
 pub mod codec;

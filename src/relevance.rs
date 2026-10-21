@@ -20,8 +20,10 @@ pub trait Relevance: Send + Sync {
     fn score(&self, weight: f64, unit_frequency: u32, norm: Self::Norm) -> f64;
 }
 
-/// BM25: a unit's frequency saturates by `k1`, and a source's length normalizes by `b` (0: not at all; 1: fully,
-/// against the average length).
+/// Okapi BM25 (Robertson et al., 1994, "Okapi at TREC-3"; Robertson and Zaragoza, 2009, "The Probabilistic
+/// Relevance Framework: BM25 and Beyond"): a unit's frequency saturates by `k1`, and a source's length normalizes by
+/// `b` (0: not at all; 1: fully, against the average length). The weight is the non-negative inverse source
+/// frequency ln(1 + (N − n + 0.5) / (n + 0.5)).
 #[derive(Clone, Copy, Debug)]
 pub struct Bm25 {
     pub k1: f64,
@@ -53,7 +55,8 @@ impl Relevance for Bm25 {
     }
 }
 
-/// Unit frequency × inverse source frequency: weight ln(1 + N / n), score weight × (1 + ln f). Ignores length.
+/// Unit frequency × inverse source frequency (Spärck Jones, 1972; Salton and Buckley, 1988): weight ln(1 + N / n),
+/// score weight × (1 + ln f). Ignores length.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TfIdf;
 

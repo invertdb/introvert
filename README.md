@@ -27,7 +27,8 @@ let wh = searcher.search(&Clause::should([Match::Prefix("wh".to_string())]), 10)
 - An `Inverter<S>` turns a source of any type `S` into units.
 - A source's key is any `K: Codec` and a unit any `U: Codec`. Bytes are only the storage format.
 
-**`Codec` is order-preserving**, so the dictionary's order is the units' order:
+**`Codec` is order-preserving** (normalized keys; Graefe, 2011), so the dictionary's order is the
+units' order:
 - A `Match::Range` of typed units is a range scan. Examples: temperatures across zero, times,
   geo cells.
 - A `Match::Prefix` of a tuple (or a struct encoded as one) stays within its leading elements,
@@ -54,12 +55,16 @@ monomorphization, with no special case.
 
 ## Design
 
+Each technique is cited where it is used and listed under [References](#references).
+
 - **Dictionary:** a b-positive tree from each unit's encoding to its postings head and count.
   Its snapshots keep readers independent of the writer, with no draining or generation swapping.
 - **Postings:** append-only records chained per unit.
-  - Records over 128 entries bit-pack 128-entry blocks behind a fixed-width block index (last
-    source, data offset, highest frequency, shortest source), which cursors binary-search to skip.
-  - Each record carries Pareto (frequency, length) impacts that bound scores.
+  - Records over 128 entries bit-pack 128-entry blocks, frame-of-reference coded (Goldstein et al.,
+    1998), behind a fixed-width block index (last source, data offset, highest frequency, shortest
+    source), which cursors binary-search to skip.
+  - Each record carries Pareto (frequency, length) impacts that bound scores (after Anh and Moffat,
+    2006).
   - Positions live in their own file, decoded only for phrases.
 - **Sources:** an ordinal per source with its key and length, in shared chunks; a snapshot copies
   nothing.
@@ -69,8 +74,10 @@ monomorphization, with no special case.
 - **Search:**
   - Boolean clauses: must, should, must-not, phrases, sub-clauses, evaluated smallest first with
     early exit on bitsets.
-  - Top-k for plain disjunctions by MaxScore, with window skipping on block maxima and inline
-    BM25. It is exactly equal to scoring every match (tested).
+  - Top-k for plain disjunctions by MaxScore (Turtle and Flood, 1995), with window skipping on
+    block maxima (Ding and Suel, 2011). It is exactly equal to scoring every match (tested).
+  - Relevance: BM25 (Robertson et al., 1994; Robertson and Zaragoza, 2009) and TF-IDF (Spärck Jones,
+    1972; Salton and Buckley, 1988).
   - Prefix and range matches expand to the units they cover, up to a limit.
 
 ## Tests
@@ -85,5 +92,23 @@ monomorphization, with no special case.
   `(String, String)` tuple units (prefixes within the first element).
 - **Codecs:** order preserved and round trips for every provided codec.
 - **Recovery:** snapshot isolation, and recovery from a crash mid-commit.
+
+## References
+
+- Anh, V. N., and Moffat, A. (2006). Pruned query evaluation using pre-computed impacts. *SIGIR 2006*.
+- Ding, S., and Suel, T. (2011). Faster top-k document retrieval using block-max indexes. *SIGIR 2011*.
+- Goldstein, J., Ramakrishnan, R., and Shaft, U. (1998). Compressing relations and indexes. *ICDE 1998*.
+- Graefe, G. (2011). Modern B-tree techniques. *Foundations and Trends in Databases* 3(4).
+- Robertson, S. E., Walker, S., Jones, S., Hancock-Beaulieu, M., and Gatford, M. (1994). Okapi at TREC-3.
+  *TREC-3*.
+- Robertson, S., and Zaragoza, H. (2009). The probabilistic relevance framework: BM25 and beyond.
+  *Foundations and Trends in Information Retrieval* 3(4).
+- Salton, G., and Buckley, C. (1988). Term-weighting approaches in automatic text retrieval.
+  *Information Processing & Management* 24(5).
+- Spärck Jones, K. (1972). A statistical interpretation of term specificity and its application in retrieval.
+  *Journal of Documentation* 28(1).
+- Turtle, H., and Flood, J. (1995). Query evaluation: strategies and optimizations.
+  *Information Processing & Management* 31(6).
+- Zobel, J., and Moffat, A. (2006). Inverted files for text search engines. *ACM Computing Surveys* 38(2).
 
 Repos are checked out side by side (`../b-positive`).

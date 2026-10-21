@@ -21,6 +21,10 @@
 //!
 //! Impacts are (frequency, source length) pairs no entry of the record beats on both, bounding what any of its sources
 //! can score. Frequencies and positions are optional per index (flags).
+//!
+//! Blocks are frame-of-reference coded (Goldstein, Ramakrishnan and Shaft, 1998): deltas in the bits the largest
+//! needs. Impacts follow Anh and Moffat (2006), here as a Pareto set rather than quantized; per-block maxima in the
+//! block index follow the block-max indexes of Ding and Suel (2011).
 
 use std::sync::Arc;
 

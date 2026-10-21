@@ -1,4 +1,5 @@
-//! How source keys and units are stored: an order-preserving encoding to bytes. If `a < b` then
+//! How source keys and units are stored: an order-preserving encoding to bytes (normalized keys, in the sense of
+//! Graefe, 2011, "Modern B-Tree Techniques"). If `a < b` then
 //! `encode(a) < encode(b)` byte-wise, so the dictionary's order is the units' order and ranges of units are ranges of
 //! bytes.
 //!
