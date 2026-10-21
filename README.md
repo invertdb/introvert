@@ -79,6 +79,9 @@ Each technique is cited where it is used and listed under [References](#referenc
   - Relevance: BM25 (Robertson et al., 1994; Robertson and Zaragoza, 2009) and TF-IDF (Spärck Jones,
     1972; Salton and Buckley, 1988).
   - Prefix and range matches expand to the units they cover, up to a limit.
+  - Alignment: the sources in which the most of a query's units occur at one offset from their
+    query positions, and that offset (the voting scheme of Wang, 2003). It's a phrase match that
+    tolerates missing units.
 
 ## Tests
 
@@ -107,6 +110,7 @@ Each technique is cited where it is used and listed under [References](#referenc
   *Information Processing & Management* 24(5).
 - Spärck Jones, K. (1972). A statistical interpretation of term specificity and its application in retrieval.
   *Journal of Documentation* 28(1).
+- Wang, A. (2003). An industrial-strength audio search algorithm. *ISMIR 2003*.
 - Turtle, H., and Flood, J. (1995). Query evaluation: strategies and optimizations.
   *Information Processing & Management* 31(6).
 - Zobel, J., and Moffat, A. (2006). Inverted files for text search engines. *ACM Computing Surveys* 38(2).

@@ -146,6 +146,18 @@ pub struct SearchResults<K> {
     pub top: Vec<SearchResult<K>>,
 }
 
+/// Where a query's units line up in a source: the offset (source position − query position) with the most of them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Alignment<K> {
+    pub source: u32,
+    pub key: K,
+    /// The query occurrences the source shares (counted from postings, positions aside).
+    pub matches: u64,
+    /// The occurrences that align at the best offset, within the tolerance.
+    pub count: u64,
+    pub offset: i64,
+}
+
 pub const DEFAULT_MAX_EXPANSION: usize = 1024;
 
 /// Searches a snapshot of an index of sources `K` over units `U`, ranking by relevance `R`.
@@ -258,6 +270,93 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
             Match::Range(start, end) => self.snapshot.encoded_units((start.as_ref(), end.as_ref())).take(self.max_expansion).map(|(_, p)| p).collect(),
             Match::Any(units) => units.iter().filter_map(|u| self.snapshot.unit(u)).collect(),
         }
+    }
+
+    /// The sources in which the most of `query`'s units (unit, position) occur at one offset from their positions in
+    /// the query: a phrase match that tolerates missing units and reports where it lines up, as audio landmark
+    /// matching does (Wang, 2003). Every pair of a query occurrence and a source occurrence of the same unit votes
+    /// for the offset between them; a source scores the votes of its best offset plus those within `tolerance` of it.
+    ///
+    /// Two passes keep it fast: count the occurrences each source shares with the query (postings only), then vote
+    /// on offsets only in the `depth` sources sharing the most (0: all). Units in more than `max_source_frequency`
+    /// sources (0: no limit) are skipped: they add many votes and little evidence.
+    pub fn align(&self, query: &[(U, u32)], top: usize, tolerance: i64, depth: usize, max_source_frequency: u64) -> Vec<Alignment<K>> {
+        let snapshot = self.snapshot;
+        let mut positions: HashMap<Vec<u8>, (UnitPostings, Vec<i64>)> = HashMap::new();
+        for (unit, position) in query {
+            let key = unit.to_bytes();
+            if let Some(entry) = positions.get_mut(&key) {
+                entry.1.push(*position as i64);
+            } else if let Some(postings) = snapshot.unit(unit)
+                && (max_source_frequency == 0 || postings.count <= max_source_frequency)
+            {
+                positions.insert(key, (postings, vec![*position as i64]));
+            }
+        }
+        let units: Vec<(UnitPostings, Vec<i64>)> = positions.into_values().collect();
+
+        // pass 1: occurrences each source shares with the query
+        let mut shared: HashMap<u32, u64> = HashMap::new();
+        for (postings, query_positions) in &units {
+            let mut cursor = snapshot.postings.cursor(postings.head);
+            while cursor.next() {
+                *shared.entry(cursor.source).or_default() += cursor.frequency as u64 * query_positions.len() as u64;
+            }
+        }
+        let mut candidates: Vec<u32> = shared.keys().copied().collect();
+        if depth > 0 && candidates.len() > depth {
+            candidates.sort_by(|a, b| shared[b].cmp(&shared[a]).then(a.cmp(b)));
+            candidates.truncate(depth);
+        }
+        let slot: HashMap<u32, u32> = candidates.iter().enumerate().map(|(i, &s)| (s, i as u32)).collect();
+
+        // pass 2: (candidate, offset) votes, packed so one sort groups them
+        let mut votes: Vec<u64> = Vec::new();
+        let mut source_positions = Vec::new();
+        for (postings, query_positions) in &units {
+            let mut cursor = snapshot.postings.cursor(postings.head);
+            while cursor.next() {
+                let Some(&candidate) = slot.get(&cursor.source) else { continue };
+                let frequency = cursor.frequency;
+                snapshot.positions(cursor.positions_offset(), frequency, &mut source_positions);
+                for &p in &source_positions {
+                    for &q in query_positions {
+                        votes.push(((candidate as u64) << 32) | ((p as i64 - q) as i32 as u32 ^ 0x8000_0000) as u64);
+                    }
+                }
+            }
+        }
+        votes.sort_unstable();
+        let offset_of = |vote: u64| (vote as u32 ^ 0x8000_0000) as i32 as i64;
+
+        // per candidate, the offset window [offset - tolerance, offset + tolerance] with the most votes
+        let mut best: Vec<Alignment<K>> = Vec::new();
+        let mut start = 0;
+        while start < votes.len() {
+            let candidate = (votes[start] >> 32) as usize;
+            let end = start + votes[start..].iter().take_while(|&&v| (v >> 32) as usize == candidate).count();
+            let source = candidates[candidate];
+            let (mut count, mut offset) = (0usize, 0i64);
+            let (mut low, mut high) = (start, start);
+            for i in start..end {
+                let o = offset_of(votes[i]);
+                while offset_of(votes[low]) < o - tolerance {
+                    low += 1;
+                }
+                while high < end && offset_of(votes[high]) <= o + tolerance {
+                    high += 1;
+                }
+                if high - low > count {
+                    count = high - low;
+                    offset = o;
+                }
+            }
+            best.push(Alignment { source, key: snapshot.key(source), matches: shared[&source], count: count as u64, offset });
+            start = end;
+        }
+        best.sort_by(|a, b| b.count.cmp(&a.count).then(a.source.cmp(&b.source)));
+        best.truncate(top);
+        best
     }
 
     /// The sources matching a clause, unranked.

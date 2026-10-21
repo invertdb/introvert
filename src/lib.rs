@@ -32,5 +32,5 @@ pub use codec::Codec;
 pub use index::{Index, Options, Snapshot, UnitPostings};
 pub use inverter::{Inverter, Words};
 pub use relevance::{Bm25, Relevance, TfIdf};
-pub use search::{Clause, Match, SearchResult, SearchResults, Searcher};
+pub use search::{Alignment, Clause, Match, SearchResult, SearchResults, Searcher};
 pub use sourceset::SourceSet;

@@ -276,3 +276,28 @@ fn snapshots_and_crash_recovery() {
     index.commit().unwrap();
     assert_eq!(index.snapshot().unit(&String::new()).unwrap().count, 1);
 }
+
+#[test]
+fn alignment_finds_where_a_query_lines_up() {
+    // sources are sequences of numbered units; a query is a stretch of one of them, with units missing and noise
+    let dir = tempfile::tempdir().unwrap();
+    let index: Index<u32, u32> = Index::open(dir.path(), Options::default()).unwrap();
+    let mut rng = StdRng::seed_from_u64(8);
+    let sequences: Vec<Vec<u32>> = (0..200).map(|_| (0..500).map(|_| rng.random_range(0..5000)).collect()).collect();
+    for (key, sequence) in sequences.iter().enumerate() {
+        index.add(&(key as u32 + 100), sequence.iter().enumerate().map(|(p, &u)| (u, p as u32)));
+    }
+    index.commit().unwrap();
+    let snapshot = index.snapshot();
+    let relevance = TfIdf;
+    let searcher = Searcher::new(&snapshot, &relevance);
+    for (source, start) in [(7usize, 120usize), (150, 0), (42, 400)] {
+        // 60 units from position `start`, every third dropped, plus 20 random units, at query positions from 1000
+        let mut query: Vec<(u32, u32)> = (0..60).filter(|i| i % 3 != 0).map(|i| (sequences[source][start + i], 1000 + i as u32)).collect();
+        query.extend((0..20).map(|i| (rng.random_range(0..5000), 1000 + i)));
+        let found = searcher.align(&query, 3, 1, 100, 0);
+        assert_eq!(found[0].key, source as u32 + 100);
+        assert_eq!(found[0].offset, start as i64 - 1000);
+        assert!(found[0].count >= 40 && (found.len() < 2 || found[1].count < 10), "{found:?}");
+    }
+}
