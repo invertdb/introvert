@@ -4,12 +4,12 @@
 //!
 //! A value encodes either last in a key (`encode`, which may run to the end of the bytes) or nested before other
 //! values (`encode_nested`, which must be self-delimiting). Tuples encode every element but the last nested, so a
-//! tuple's encoding begins with its leading elements' — which is what makes [`crate::Term::Prefix`] mean "these
+//! tuple's encoding begins with its leading elements' — which is what makes [`crate::Match::Prefix`] mean "these
 //! leading elements, and a last element starting with this".
 //!
 //! Provided: byte strings and strings (nested: zero bytes escaped as 00 FF, terminated by 00 00), unsigned and signed
 //! integers (big-endian, sign bit flipped), `bool`, `char`, `f64` (IEEE bits, negatives inverted; NaN sorts last),
-//! `()`, and tuples of up to four. Implement `Codec` for a struct by delegating to a tuple of its fields.
+//! `()`, and tuples of up to four. Implement `Codec` for a struct by delegating to a tuple of its members.
 
 pub trait Codec: Sized {
     /// Appends the encoding, as the last value in a key.

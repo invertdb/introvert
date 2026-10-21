@@ -1,4 +1,4 @@
-//! An index of sources of type `S` inverted into units of type `U`: a dictionary from unit to its postings (a
+//! An index of sources keyed by `K` inverted into units of type `U`: a dictionary from unit to its postings (a
 //! b-positive tree, keyed by the units' order-preserving encoding, so the dictionary's order is the units' order),
 //! the postings and positions files, and the sources. One writer adds sources and commits; any number of snapshots
 //! read.
@@ -79,8 +79,8 @@ struct Published {
     sources: Sources,
 }
 
-/// An inverted index of sources `S` over units `U` (any types with an order-preserving [`Codec`]).
-pub struct Index<S, U> {
+/// An inverted index of sources keyed by `K` over units `U` (any types with an order-preserving [`Codec`]).
+pub struct Index<K, U> {
     dict: Db,
     postings_file: File,
     positions_file: Option<File>,
@@ -88,14 +88,14 @@ pub struct Index<S, U> {
     options: Options,
     writing: Mutex<Writing>,
     published: RwLock<Published>,
-    types: PhantomData<fn() -> (S, U)>,
+    types: PhantomData<fn() -> (K, U)>,
 }
 
 fn open_append(path: &PathBuf) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)
 }
 
-impl<S: Codec, U: Codec> Index<S, U> {
+impl<K: Codec, U: Codec> Index<K, U> {
     pub fn open(directory: impl AsRef<Path>, options: Options) -> io::Result<Self> {
         let directory = directory.as_ref();
         std::fs::create_dir_all(directory)?;
@@ -162,16 +162,16 @@ impl<S: Codec, U: Codec> Index<S, U> {
         self.options
     }
 
-    /// Inverts a source with an inverter and adds it (see [`Index::add`]).
-    pub fn invert<D: ?Sized, I: Inverter<D, Unit = U>>(&self, key: &S, source: &D, inverter: &I) -> u32 {
+    /// Inverts a source with an inverter and adds it under its key (see [`Index::add`]).
+    pub fn invert<S: ?Sized, I: Inverter<S, Unit = U>>(&self, key: &K, source: &S, inverter: &I) -> u32 {
         let mut units = Vec::new();
         inverter.invert(source, |u, p| units.push((u, p)));
         self.add(key, units)
     }
 
-    /// Adds a source: its key and its units, with their positions. Returns its ordinal. Visible to snapshots taken
+    /// Adds a source: its key and its units, with their positions. Returns the source's ordinal. Visible to snapshots taken
     /// after the next [`Index::commit`].
-    pub fn add(&self, key: &S, units: impl IntoIterator<Item = (U, u32)>) -> u32 {
+    pub fn add(&self, key: &K, units: impl IntoIterator<Item = (U, u32)>) -> u32 {
         // every unit's dictionary key in one buffer, then grouped by key
         let mut encoded = Vec::new();
         let mut spans = Vec::new();
@@ -277,7 +277,7 @@ impl<S: Codec, U: Codec> Index<S, U> {
     }
 
     /// What the last commit holds; cheap, and usable from any thread.
-    pub fn snapshot(&self) -> Snapshot<S, U> {
+    pub fn snapshot(&self) -> Snapshot<K, U> {
         let published = self.published.read().unwrap();
         Snapshot {
             dict: self.dict.begin_read(),
@@ -311,27 +311,27 @@ impl UnitPostings {
 }
 
 /// The index as of a commit.
-pub struct Snapshot<S, U> {
+pub struct Snapshot<K, U> {
     dict: ReadTxn,
     pub postings: Postings,
     positions: Option<Arc<Mmap>>,
     pub(crate) sources: Sources,
-    types: PhantomData<fn() -> (S, U)>,
+    types: PhantomData<fn() -> (K, U)>,
 }
 
-impl<S: Codec, U: Codec> Snapshot<S, U> {
+impl<K: Codec, U: Codec> Snapshot<K, U> {
     pub fn source_count(&self) -> u32 {
         self.sources.count()
     }
 
-    /// The key of the source with this ordinal.
-    pub fn source(&self, ordinal: u32) -> S {
-        S::decode(self.sources.key(ordinal))
+    /// A source's key.
+    pub fn key(&self, source: u32) -> K {
+        K::decode(self.sources.key(source))
     }
 
-    /// The source's length in units.
-    pub fn source_length(&self, ordinal: u32) -> u32 {
-        self.sources.length(ordinal)
+    /// A source's length in units.
+    pub fn source_length(&self, source: u32) -> u32 {
+        self.sources.length(source)
     }
 
     pub fn average_length(&self) -> f64 {

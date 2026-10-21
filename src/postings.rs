@@ -106,18 +106,18 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
     let count = buffer.sources.len();
     out.extend_from_slice(&previous.to_le_bytes());
     varint::write(out, count as u64);
-    let (docs, freqs, offsets) = (&buffer.sources, &buffer.frequencies, &buffer.positions);
+    let (sources, freqs, offsets) = (&buffer.sources, &buffer.frequencies, &buffer.positions);
 
-    let write_varints = |out: &mut Vec<u8>, from: usize, mut doc: u32, mut offset: u64| {
+    let write_varints = |out: &mut Vec<u8>, from: usize, mut source: u32, mut offset: u64| {
         for i in from..count {
-            varint::write(out, (docs[i] - doc) as u64);
+            varint::write(out, (sources[i] - source) as u64);
             if frequencies {
                 varint::write(out, freqs[i] as u64);
             }
             if positions {
                 varint::write(out, offsets[i] - offset);
             }
-            doc = docs[i];
+            source = sources[i];
             offset = offsets[i];
         }
     };
@@ -127,7 +127,7 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
     }
 
     let blocks = count / BLOCK;
-    varint::write(out, docs[0] as u64);
+    varint::write(out, sources[0] as u64);
     if positions {
         varint::write(out, offsets[0]);
     }
@@ -142,9 +142,9 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
     let mut values = [0u64; BLOCK];
     for b in 0..blocks {
         let first = b * BLOCK;
-        let base_doc = if b == 0 { docs[0] - 1 } else { docs[first - 1] };
+        let base_source = if b == 0 { sources[0] - 1 } else { sources[first - 1] };
         let base_offset = if b == 0 { offsets[0] } else { offsets[first - 1] };
-        index.extend_from_slice(&docs[first + BLOCK - 1].to_le_bytes());
+        index.extend_from_slice(&sources[first + BLOCK - 1].to_le_bytes());
         index.extend_from_slice(&(data.len() as u32).to_le_bytes());
         index.extend_from_slice(&buffer.block_maxima[b].0.to_le_bytes());
         index.extend_from_slice(&buffer.block_maxima[b].1.to_le_bytes());
@@ -153,9 +153,9 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
         }
 
         for i in 0..BLOCK {
-            values[i] = (docs[first + i] - if i == 0 { base_doc } else { docs[first + i - 1] }) as u64;
+            values[i] = (sources[first + i] - if i == 0 { base_source } else { sources[first + i - 1] }) as u64;
         }
-        let doc_width = bitpack::width(values.iter().copied().max().unwrap());
+        let source_width = bitpack::width(values.iter().copied().max().unwrap());
         let mut freq_values = [0u64; BLOCK];
         let mut offset_values = [0u64; BLOCK];
         for i in 0..BLOCK {
@@ -164,14 +164,14 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
         }
         let freq_width = bitpack::width(freq_values.iter().copied().max().unwrap());
         let offset_width = bitpack::width(offset_values.iter().copied().max().unwrap());
-        data.push(doc_width as u8);
+        data.push(source_width as u8);
         if frequencies {
             data.push(freq_width as u8);
         }
         if positions {
             data.push(offset_width as u8);
         }
-        bitpack::pack(&values, doc_width, &mut data);
+        bitpack::pack(&values, source_width, &mut data);
         if frequencies {
             bitpack::pack(&freq_values, freq_width, &mut data);
         }
@@ -183,7 +183,7 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out.extend_from_slice(&data);
     let last = blocks * BLOCK - 1;
-    write_varints(out, blocks * BLOCK, docs[last], offsets[last]);
+    write_varints(out, blocks * BLOCK, sources[last], offsets[last]);
     out.extend_from_slice(&[0; bitpack::PADDING]);
 }
 
@@ -304,7 +304,7 @@ impl Postings {
     pub fn add_sources_to(&self, head: u64, set: &mut SourceSet) {
         let mut cursor = self.cursor(head);
         while cursor.next() {
-            set.insert(cursor.doc);
+            set.insert(cursor.source);
         }
     }
 
@@ -313,7 +313,7 @@ impl Postings {
         let mut out = Vec::new();
         let mut cursor = self.cursor(head);
         while cursor.next() {
-            out.push((cursor.doc, cursor.frequency, cursor.positions_offset()));
+            out.push((cursor.source, cursor.frequency, cursor.positions_offset()));
         }
         out
     }
@@ -327,14 +327,14 @@ impl Postings {
             view: Packed::default(),
             block: 0,
             entry: 0,
-            docs: [0; BLOCK],
+            sources: [0; BLOCK],
             freqs: [0; BLOCK],
             offsets: [0; BLOCK],
             offsets_decoded: false,
             at: 0,
             remaining: 0,
             running_offset: 0,
-            doc: NOT_STARTED,
+            source: NOT_STARTED,
             frequency: 0,
         }
     }
@@ -354,7 +354,7 @@ pub struct Cursor<'a> {
     view: Packed,
     block: usize,   // current block of a packed record (== blocks: in its varint tail)
     entry: usize,   // index in the block (BEFORE: before its first)
-    docs: [u32; BLOCK],
+    sources: [u32; BLOCK],
     freqs: [u32; BLOCK],
     offsets: [u64; BLOCK],
     offsets_decoded: bool,
@@ -362,14 +362,14 @@ pub struct Cursor<'a> {
     remaining: usize,
     running_offset: u64,
     /// The current source: NOT_STARTED, a source, or NO_MORE.
-    pub doc: u32,
+    pub source: u32,
     pub frequency: u32,
 }
 
 impl<'a> Cursor<'a> {
     #[inline]
-    fn index_u32(&self, block: usize, field: usize) -> u32 {
-        let at = self.view.index + block * self.view.entry + field;
+    fn index_u32(&self, block: usize, offset: usize) -> u32 {
+        let at = self.view.index + block * self.view.entry + offset;
         u32::from_le_bytes(self.postings.bytes()[at..at + 4].try_into().unwrap())
     }
 
@@ -400,14 +400,14 @@ impl<'a> Cursor<'a> {
             if self.packed && self.block < self.view.blocks {
                 self.entry = self.entry.wrapping_add(1);
                 if self.entry < BLOCK {
-                    self.doc = self.docs[self.entry];
+                    self.source = self.sources[self.entry];
                     self.frequency = self.freqs[self.entry];
                     return true;
                 }
                 if self.block + 1 < self.view.blocks {
                     self.load_block(self.block + 1);
                     self.entry = 0;
-                    self.doc = self.docs[0];
+                    self.source = self.sources[0];
                     self.frequency = self.freqs[0];
                     return true;
                 }
@@ -425,18 +425,18 @@ impl<'a> Cursor<'a> {
 
     /// Moves to the first entry at or after `target` (no move if already there); false when there is none.
     pub fn advance(&mut self, target: u32) -> bool {
-        if self.doc != NOT_STARTED && self.doc >= target {
-            return self.doc != NO_MORE;
+        if self.source != NOT_STARTED && self.source >= target {
+            return self.source != NO_MORE;
         }
         loop {
             if self.packed && self.block < self.view.blocks {
-                if self.docs[BLOCK - 1] >= target {
+                if self.sources[BLOCK - 1] >= target {
                     let mut i = self.entry.wrapping_add(1);
-                    while self.docs[i] < target {
+                    while self.sources[i] < target {
                         i += 1;
                     }
                     self.entry = i;
-                    self.doc = self.docs[i];
+                    self.source = self.sources[i];
                     self.frequency = self.freqs[i];
                     return true;
                 }
@@ -449,11 +449,11 @@ impl<'a> Cursor<'a> {
                 if low < self.view.blocks {
                     self.load_block(low);
                     let mut i = 0;
-                    while self.docs[i] < target {
+                    while self.sources[i] < target {
                         i += 1;
                     }
                     self.entry = i;
-                    self.doc = self.docs[i];
+                    self.source = self.sources[i];
                     self.frequency = self.freqs[i];
                     return true;
                 }
@@ -461,7 +461,7 @@ impl<'a> Cursor<'a> {
             }
             while self.remaining > 0 {
                 self.read_varint();
-                if self.doc >= target {
+                if self.source >= target {
                     return true;
                 }
             }
@@ -474,14 +474,14 @@ impl<'a> Cursor<'a> {
     /// The block holding this cursor's entries from `target` on (not before the current entry): its last source,
     /// highest frequency and shortest source. None when not known (outside a packed record's blocks). Moves nothing.
     pub fn block_at(&self, target: u32) -> Option<(u32, u32, u32)> {
-        if self.doc == NO_MORE {
+        if self.source == NO_MORE {
             return Some((NO_MORE, 0, 0));
         }
         if !self.packed || self.block >= self.view.blocks {
             return None;
         }
         let mut block = self.block;
-        if self.docs[BLOCK - 1] < target {
+        if self.sources[BLOCK - 1] < target {
             let (mut low, mut high) = (self.block + 1, self.view.blocks);
             while low < high {
                 let mid = (low + high) / 2;
@@ -499,17 +499,17 @@ impl<'a> Cursor<'a> {
         self.block = block;
         let bytes = self.postings.bytes();
         let data = self.view.data + self.index_u32(block, 4) as usize;
-        let doc_width = bytes[data] as u32;
+        let source_width = bytes[data] as u32;
         let freq_width = if self.postings.frequencies { bytes[data + 1] as u32 } else { 0 };
         let packed = data + self.view.widths;
-        bitpack::unpack_u32(&bytes[packed..], doc_width, &mut self.docs);
+        bitpack::unpack_u32(&bytes[packed..], source_width, &mut self.sources);
         let mut source = if block == 0 { self.view.first_source.wrapping_sub(1) } else { self.block_last(block - 1) };
-        for d in self.docs.iter_mut() {
+        for d in self.sources.iter_mut() {
             source = source.wrapping_add(*d);
             *d = source;
         }
         if self.postings.frequencies {
-            bitpack::unpack_u32(&bytes[packed + bitpack::bytes(BLOCK, doc_width)..], freq_width, &mut self.freqs);
+            bitpack::unpack_u32(&bytes[packed + bitpack::bytes(BLOCK, source_width)..], freq_width, &mut self.freqs);
             for f in self.freqs.iter_mut() {
                 *f += 1;
             }
@@ -522,10 +522,10 @@ impl<'a> Cursor<'a> {
     fn decode_offsets(&mut self) {
         let bytes = self.postings.bytes();
         let data = self.view.data + self.index_u32(self.block, 4) as usize;
-        let doc_width = bytes[data] as u32;
+        let source_width = bytes[data] as u32;
         let freq_width = if self.postings.frequencies { bytes[data + 1] as u32 } else { 0 };
         let offset_width = bytes[data + self.view.widths - 1] as u32;
-        let packed = data + self.view.widths + bitpack::bytes(BLOCK, doc_width) + if self.postings.frequencies { bitpack::bytes(BLOCK, freq_width) } else { 0 };
+        let packed = data + self.view.widths + bitpack::bytes(BLOCK, source_width) + if self.postings.frequencies { bitpack::bytes(BLOCK, freq_width) } else { 0 };
         bitpack::unpack_u64(&bytes[packed..], offset_width, &mut self.offsets);
         let mut position = if self.block == 0 { self.view.first_positions } else { self.block_positions_last(self.block - 1) };
         for o in self.offsets.iter_mut() {
@@ -537,7 +537,7 @@ impl<'a> Cursor<'a> {
 
     fn enter_tail(&mut self) {
         let last = self.view.blocks - 1;
-        self.doc = self.block_last(last);
+        self.source = self.block_last(last);
         self.running_offset = if self.postings.positions { self.block_positions_last(last) } else { 0 };
         self.at = self.view.tail;
         self.remaining = self.view.count - self.view.blocks * BLOCK;
@@ -547,8 +547,8 @@ impl<'a> Cursor<'a> {
     #[inline]
     fn read_varint(&mut self) {
         let bytes = self.postings.bytes();
-        let base = if self.doc == NOT_STARTED { 0 } else { self.doc };
-        self.doc = base + varint::read(bytes, &mut self.at) as u32;
+        let base = if self.source == NOT_STARTED { 0 } else { self.source };
+        self.source = base + varint::read(bytes, &mut self.at) as u32;
         self.frequency = if self.postings.frequencies { varint::read(bytes, &mut self.at) as u32 } else { 1 };
         if self.postings.positions {
             self.running_offset += varint::read(bytes, &mut self.at);
@@ -559,12 +559,12 @@ impl<'a> Cursor<'a> {
     fn enter_next_record(&mut self) -> bool {
         self.record = self.record.wrapping_add(1);
         if self.record >= self.records.len() {
-            self.doc = NO_MORE;
+            self.source = NO_MORE;
             return false;
         }
         let mut at = self.records[self.record] as usize + 8;
         let count = varint::read(self.postings.bytes(), &mut at) as usize;
-        self.doc = NOT_STARTED; // deltas restart in each record
+        self.source = NOT_STARTED; // deltas restart in each record
         self.running_offset = 0;
         self.packed = count > BLOCK;
         if self.packed {

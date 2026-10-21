@@ -1,49 +1,61 @@
 # introvert
 
-A generic inverted index: any source inverted into any units (the words of a document, the labels of a time
-series, the cells of a place, the landmarks of a song), ranked with BM25 or TF-IDF. The engine of invertdb,
-reimplemented from bsharptree's `simpleindex`, on [b-positive](https://github.com/invertdb/b-positive).
+A generic inverted index: any source type inverted into any unit type, ranked with BM25 or TF-IDF. Examples: the
+words of a text, the labels of a time series, the cells of a place, the landmarks of a song. The engine of
+invertdb, reimplemented from bsharptree's `simpleindex`, on [b-positive](https://github.com/invertdb/b-positive).
 
 ```rust
-use introvert::{Bm25, Clause, Index, Searcher, Term, Words};
+use introvert::{Bm25, Clause, Index, Match, Searcher, Words};
 
-// any source type S, any unit type U (each with an order-preserving Codec)
+// sources keyed by any K, inverted into any units U (each with an order-preserving Codec)
 let index: Index<u32, String> = Index::open("idx", Default::default())?;
-index.invert(&1, "the white whale", &Words::default());   // an Inverter<D> turns a D into units
+index.invert(&1, "the white whale", &Words::default());   // an Inverter<S> turns a source S into units
 index.commit()?;
 
 let snapshot = index.snapshot();                           // any thread; unaffected by later commits
 let bm25 = Bm25::default();
 let searcher = Searcher::new(&snapshot, &bm25);            // generic over the relevance: scoring compiles inline
-let hits = searcher.search(&Clause::should(["whale".to_string()]), 10).top;    // Hit<u32>: hits[0].source == 1
-let wh = searcher.search(&Clause::should([Term::Prefix("wh".to_string())]), 10);
+let top = searcher.search(&Clause::should(["whale".to_string()]), 10).top;    // SearchResult<u32>: top[0].key == 1
+let wh = searcher.search(&Clause::should([Match::Prefix("wh".to_string())]), 10);
 ```
 
 ## Generics
 
 **Everything is typed:**
-- `Index<S, U>`, `Snapshot<S, U>`, `Clause<U>`, `Term<U>`, `Hit<S>`, and `Searcher<S, U, R>` with
-  `R: Relevance`.
-- An `Inverter<D>` turns a document of any type into units.
-- A source key is any `S: Codec` and a unit any `U: Codec`. Bytes are only the storage format.
+- `Index<K, U>`, `Snapshot<K, U>`, `Clause<U>`, `Match<U>`, `SearchResults<K>`, and
+  `Searcher<K, U, R>` with `R: Relevance`.
+- An `Inverter<S>` turns a source of any type `S` into units.
+- A source's key is any `K: Codec` and a unit any `U: Codec`. Bytes are only the storage format.
 
 **`Codec` is order-preserving**, so the dictionary's order is the units' order:
-- A `Term::Range` of typed units is a range scan. Examples: temperatures across zero, times,
+- A `Match::Range` of typed units is a range scan. Examples: temperatures across zero, times,
   geo cells.
-- A `Term::Prefix` of a tuple (or a struct encoded as one) stays within its leading elements, e.g.
-  `(field, "whal")`.
+- A `Match::Prefix` of a tuple (or a struct encoded as one) stays within its leading elements,
+  e.g. `("title", "whal")`.
 - Provided codecs: strings, byte vectors, all integer widths (signed sorted correctly), `f64`
   (totally ordered), `bool`, `char`, `()`, and tuples of up to four. A struct implements `Codec`
-  by delegating to its fields.
+  by delegating to its members.
 
 **`Relevance` is a type parameter**, not a trait object. A source's length enters once per
 candidate through `Relevance::Norm`, so BM25's per-candidate norm is shared across units by
 monomorphization, with no special case.
 
+## Vocabulary
+
+| | |
+|---|---|
+| **source** | What is inverted (a text, a series, a place, a song). It has a key `K`, an ordinal (its position in the index) and a length in units. |
+| **unit** | What a source is inverted into, at positions. |
+| **inverter** | Turns a source into units. |
+| **postings** | A unit's sources, with frequencies and positions. |
+| **match** | What a query covers: a unit, a prefix, or a range of units. |
+| **clause** | Must, should and must-not matches and sub-clauses, or a phrase of units. |
+| **relevance** | Weight (per unit) and score (per unit in a source). |
+
 ## Design
 
-- **Dictionary:** a b-positive tree from each unit's encoding to its postings head and count. Its snapshots keep readers independent of the writer, with no draining
-  or generation swapping.
+- **Dictionary:** a b-positive tree from each unit's encoding to its postings head and count.
+  Its snapshots keep readers independent of the writer, with no draining or generation swapping.
 - **Postings:** append-only records chained per unit.
   - Records over 128 entries bit-pack 128-entry blocks behind a fixed-width block index (last
     source, data offset, highest frequency, shortest source), which cursors binary-search to skip.
@@ -59,7 +71,7 @@ monomorphization, with no special case.
     early exit on bitsets.
   - Top-k for plain disjunctions by MaxScore, with window skipping on block maxima and inline
     BM25. It is exactly equal to scoring every match (tested).
-  - Prefix and range terms expand to the units they cover, up to a limit.
+  - Prefix and range matches expand to the units they cover, up to a limit.
 
 ## Tests
 
@@ -70,7 +82,7 @@ monomorphization, with no special case.
   top 1, 10, 100).
 - **Queries:** booleans, phrases, prefixes and ranges.
 - **Typed indexes:** `(String, u16)` keys over a struct unit (signed ranges across zero), and
-  `(field, term)` tuple units (prefixes within a field).
+  `(String, String)` tuple units (prefixes within the first element).
 - **Codecs:** order preserved and round trips for every provided codec.
 - **Recovery:** snapshot isolation, and recovery from a crash mid-commit.
 

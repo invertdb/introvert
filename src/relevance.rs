@@ -25,7 +25,7 @@ pub trait Relevance: Send + Sync {
 pub struct Bm25 {
     pub k1: f64,
     pub b: f64,
-    /// Lengths rounded as Lucene stores them (a one-byte norm), as Elasticsearch scores.
+    /// Lengths rounded to Lucene's one-byte norms.
     pub quantize_lengths: bool,
 }
 

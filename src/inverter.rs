@@ -3,15 +3,15 @@
 
 use unicode_general_category::{get_general_category, GeneralCategory as G};
 
-/// Turns a source of type `D` into units, each at a position (positions order units for phrases; an inverter
+/// Turns a source of type `S` into units, each at a position (positions order units for phrases; an inverter
 /// without order may give every unit position 0).
-pub trait Inverter<D: ?Sized> {
+pub trait Inverter<S: ?Sized> {
     type Unit;
 
-    fn invert(&self, source: &D, unit: impl FnMut(Self::Unit, u32));
+    fn invert(&self, source: &S, unit: impl FnMut(Self::Unit, u32));
 
     /// The units, in order.
-    fn units(&self, source: &D) -> Vec<(Self::Unit, u32)> {
+    fn units(&self, source: &S) -> Vec<(Self::Unit, u32)> {
         let mut out = Vec::new();
         self.invert(source, |u, p| out.push((u, p)));
         out

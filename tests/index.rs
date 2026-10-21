@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use std::ops::Bound;
 
-use introvert::{Bm25, Clause, Codec, Index, Options, Relevance, Searcher, Snapshot, SourceSet, Term, TfIdf, Words};
+use introvert::{Bm25, Clause, Codec, Index, Options, Relevance, Searcher, Snapshot, SourceSet, Match, TfIdf, Words};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -24,7 +24,7 @@ fn build(seed: u64) -> Built {
     for s in 0..20_000u32 {
         let length = rng.random_range(5..80);
         let units: Vec<&String> = (0..length).map(|_| &vocabulary[(3000.0 * rng.random::<f64>().powi(3)) as usize]).collect();
-        let ordinal = index.add(&format!("doc{s}"), units.iter().enumerate().map(|(i, u)| ((*u).clone(), i as u32)));
+        let ordinal = index.add(&format!("source{s}"), units.iter().enumerate().map(|(i, u)| ((*u).clone(), i as u32)));
         assert_eq!(ordinal, s);
         let mut counts: BTreeMap<&String, u32> = BTreeMap::new();
         for u in &units {
@@ -70,7 +70,7 @@ fn postings_hold_exactly_what_was_added() {
                 break;
             }
             assert!(found);
-            assert_eq!((cursor.doc, cursor.frequency), added[i], "{unit}: advancing to {target}");
+            assert_eq!((cursor.source, cursor.frequency), added[i], "{unit}: advancing to {target}");
         }
 
         // positions point at where the unit is
@@ -90,14 +90,14 @@ fn pruned_equals_exhaustive<R: Relevance>(built: &Built, snapshot: &Snapshot<Str
     for top in [1usize, 10, 100] {
         let mut pruned = 0;
         for q in 0..150 {
-            let terms = rng.random_range(1..7);
-            let units: Vec<String> = (0..terms)
+            let count = rng.random_range(1..7);
+            let units: Vec<String> = (0..count)
                 .map(|t| if rng.random_range(0..4) == 0 { format!("missing{t}") } else { built.vocabulary[(3000.0 * rng.random::<f64>().powi(2)) as usize].clone() })
                 .collect();
             let clause = Clause::should(units);
             let expected = searcher.search_all(&clause, top);
             let actual = searcher.search(&clause, top);
-            if !actual.exact {
+            if !actual.count_is_exact {
                 pruned += 1;
             }
             assert_eq!(actual.top, expected.top, "query {q} (top {top}): {:?}", clause.should);
@@ -121,16 +121,16 @@ fn pruned_searches_return_what_scoring_everything_returns() {
 fn boolean_clauses_and_phrases() {
     let dir = tempfile::tempdir().unwrap();
     let index: Index<u32, String> = Index::open(dir.path(), Options::default()).unwrap();
-    let docs = ["the white whale swims", "a whale of a time", "white sand and a white whale", "the sea"];
-    for (i, d) in docs.iter().enumerate() {
-        index.invert(&(i as u32 * 10), *d, &Words::default());
+    let texts = ["the white whale swims", "a whale of a time", "white sand and a white whale", "the sea"];
+    for (i, text) in texts.iter().enumerate() {
+        index.invert(&(i as u32 * 10), *text, &Words::default());
     }
     index.commit().unwrap();
     let snapshot = index.snapshot();
     let bm25 = Bm25::default();
     let searcher = Searcher::new(&snapshot, &bm25);
     let keys = |c: &Clause<String>| {
-        let mut k: Vec<u32> = searcher.search(c, 10).top.iter().map(|h| h.source).collect();
+        let mut k: Vec<u32> = searcher.search(c, 10).top.iter().map(|r| r.key).collect();
         k.sort();
         k
     };
@@ -139,13 +139,13 @@ fn boolean_clauses_and_phrases() {
     assert_eq!(keys(&Clause::phrase([s("a"), s("white")])), vec![20]);
     assert_eq!(keys(&Clause::must([s("whale")])), vec![0, 10, 20]);
     let mut c = Clause::must([s("whale")]);
-    c.must_not = vec![Term::Unit(s("white"))];
+    c.must_not = vec![Match::Unit(s("white"))];
     assert_eq!(keys(&c), vec![10]);
     let mut c = Clause::default();
-    c.must_not = vec![Term::Unit(s("whale"))];
+    c.must_not = vec![Match::Unit(s("whale"))];
     assert_eq!(keys(&c), vec![30]);
-    assert_eq!(keys(&Clause::should([Term::Prefix(s("wh"))])), vec![0, 10, 20]);
-    assert_eq!(keys(&Clause::must([Term::Range(Bound::Included(s("sa")), Bound::Excluded(s("t")))])), vec![0, 20, 30]);
+    assert_eq!(keys(&Clause::should([Match::Prefix(s("wh"))])), vec![0, 10, 20]);
+    assert_eq!(keys(&Clause::must([Match::Range(Bound::Included(s("sa")), Bound::Excluded(s("t")))])), vec![0, 20, 30]);
 }
 
 /// A unit of a typed index: a measurement's name and a bucketed value, ordered by name then value.
@@ -187,23 +187,23 @@ fn typed_units_and_ranges() {
     let bm25 = Bm25::default();
     let searcher = Searcher::new(&snapshot, &bm25);
     let sources = |c: Clause<Reading>| {
-        let mut s: Vec<(String, u16)> = searcher.search(&c, 10).top.into_iter().map(|h| h.source).collect();
+        let mut s: Vec<(String, u16)> = searcher.search(&c, 10).top.into_iter().map(|r| r.key).collect();
         s.sort();
         s
     };
     // below freezing, across the sign boundary
-    let freezing = Term::Range(Bound::Included(r("temp", i64::MIN)), Bound::Excluded(r("temp", 0)));
+    let freezing = Match::Range(Bound::Included(r("temp", i64::MIN)), Bound::Excluded(r("temp", 0)));
     assert_eq!(sources(Clause::must([freezing])), vec![("oslo".into(), 1), ("oslo".into(), 2)]);
-    let warm = Term::Range(Bound::Included(r("temp", 15)), Bound::Included(r("temp", i64::MAX)));
-    let windy = Term::Range(Bound::Included(r("wind", 5)), Bound::Included(r("wind", i64::MAX)));
+    let warm = Match::Range(Bound::Included(r("temp", 15)), Bound::Included(r("temp", i64::MAX)));
+    let windy = Match::Range(Bound::Included(r("wind", 5)), Bound::Included(r("wind", i64::MAX)));
     assert_eq!(sources(Clause { must: vec![warm], must_not: vec![windy], ..Default::default() }), vec![("lima".into(), 1), ("lima".into(), 2)]);
     // ranges are over whole units: unbounded, this one runs past "temp" into "tempest" and "wind" (oslo 1: wind 4)
-    let past = Term::Range(Bound::Included(r("temp", 15)), Bound::Unbounded);
+    let past = Match::Range(Bound::Included(r("temp", 15)), Bound::Unbounded);
     assert_eq!(sources(Clause::must([past])), vec![("lima".into(), 1), ("lima".into(), 2), ("oslo".into(), 1), ("oslo".into(), 2)]);
     // the units in order: by metric, then by value (negatives first)
     let temps: Vec<i64> = snapshot.units(r("temp", i64::MIN)..r("temp", i64::MAX)).map(|(u, _)| u.bucket).collect();
     assert_eq!(temps, vec![-12, -3, 19, 22]);
-    assert_eq!(snapshot.source(2), ("lima".to_string(), 1));
+    assert_eq!(snapshot.key(2), ("lima".to_string(), 1));
 }
 
 #[test]
@@ -214,8 +214,8 @@ fn prefixes_of_tuple_units_stay_within_leading_elements() {
     for (id, title, text) in [("a", "Whale Song", "the sea"), ("b", "Sea Shanties", "a whale of a time"), ("c", "Whaling", "harpoons")] {
         let mut units = Vec::new();
         let mut position = 0;
-        for (field, value) in [("title", title), ("text", text)] {
-            words.each(value, |w, p| units.push(((field.to_string(), w.to_string()), position + p)));
+        for (part, value) in [("title", title), ("text", text)] {
+            words.each(value, |w, p| units.push(((part.to_string(), w.to_string()), position + p)));
             position += 100;
         }
         index.add(&id.to_string(), units);
@@ -225,13 +225,13 @@ fn prefixes_of_tuple_units_stay_within_leading_elements() {
     let bm25 = Bm25::default();
     let searcher = Searcher::new(&snapshot, &bm25);
     let ids = |c: Clause<(String, String)>| {
-        let mut s: Vec<String> = searcher.search(&c, 10).top.into_iter().map(|h| h.source).collect();
+        let mut s: Vec<String> = searcher.search(&c, 10).top.into_iter().map(|r| r.key).collect();
         s.sort();
         s
     };
     let t = |f: &str, w: &str| (f.to_string(), w.to_string());
-    assert_eq!(ids(Clause::should([Term::Prefix(t("title", "whal"))])), vec!["a", "c"]);
-    assert_eq!(ids(Clause::should([Term::Prefix(t("text", "whal"))])), vec!["b"]);
+    assert_eq!(ids(Clause::should([Match::Prefix(t("title", "whal"))])), vec!["a", "c"]);
+    assert_eq!(ids(Clause::should([Match::Prefix(t("text", "whal"))])), vec!["b"]);
     assert_eq!(ids(Clause::phrase([t("text", "a"), t("text", "whale")])), vec!["b"]);
     let titles: Vec<String> = snapshot.units_with_prefix(&t("title", "")).map(|(u, _)| u.1).collect();
     assert_eq!(titles, vec!["sea", "shanties", "song", "whale", "whaling"]);
@@ -262,7 +262,7 @@ fn snapshots_and_crash_recovery() {
     let index: Index<String, String> = Index::open(dir.path(), Options::default()).unwrap();
     let snapshot = index.snapshot();
     assert_eq!(snapshot.source_count(), 2);
-    assert_eq!(snapshot.source(1), "b");
+    assert_eq!(snapshot.key(1), "b");
     assert_eq!(snapshot.unit(&"z".into()), None);
     index.add(&"d".into(), [(x(), 0)]);
     index.commit().unwrap();
