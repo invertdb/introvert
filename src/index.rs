@@ -19,6 +19,7 @@ use larry::{Blob, Store, View};
 use crate::codec::Codec;
 use crate::inverter::Inverter;
 use crate::postings::{self, Buffer, Postings, NO_RECORD};
+pub use crate::postings::UnitPostings;
 use crate::sources::Sources;
 use crate::varint;
 
@@ -225,25 +226,33 @@ impl<K: Codec, U: Codec> Index<K, U> {
     /// Makes everything added since the last commit durable and visible to new snapshots. The blobs are appended
     /// first and the dictionary (with the lengths that are now valid) commits last: a crash anywhere leaves the
     /// previous commit.
+    ///
+    /// The units go into the dictionary in one sorted pass. A unit with no record whose entries fit stays inline in
+    /// its value (with any it had inline before); past that, its entries move to a record, and later ones chain.
     pub fn commit(&self) -> io::Result<()> {
-        let mut w = self.writing.lock().unwrap();
+        let mut guard = self.writing.lock().unwrap();
+        let w = &mut *guard;
         let mut units: Vec<(Vec<u8>, Buffer)> = w.buffers.drain().collect();
         units.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
+        let (frequencies, positions) = (self.options.frequencies, self.options.positions);
         let mut txn = self.dict.begin_write();
         let mut records = Vec::with_capacity(units.iter().map(|(_, b)| b.sources.len() * 3).sum::<usize>());
-        for (unit, buffer) in &units {
-            let (previous, count) = match txn.get(unit) {
-                Some(v) => (u64::from_le_bytes(v[0..8].try_into().unwrap()), u64::from_le_bytes(v[8..16].try_into().unwrap())),
-                None => (NO_RECORD, 0),
-            };
-            let head = w.meta.postings_length + records.len() as u64;
-            postings::encode_record(previous, buffer, self.options.frequencies, self.options.positions, &mut records);
-            let mut value = [0u8; 16];
-            value[0..8].copy_from_slice(&head.to_le_bytes());
-            value[8..16].copy_from_slice(&(count + buffer.sources.len() as u64).to_le_bytes());
-            txn.put(unit, &value)?;
-        }
+        let mut scratch = Vec::new();
+        let keys: Vec<&[u8]> = units.iter().map(|(k, _)| k.as_slice()).collect();
+        let base = w.meta.postings_length;
+        let sources = &w.sources;
+        txn.put_sorted(&keys, |i, old| {
+            let buffer = &units[i].1;
+            match old.map(UnitPostings::decode) {
+                None => postings::encode_unit(NO_RECORD, 0, buffer, frequencies, positions, base, &mut records, &mut scratch),
+                Some(old) if old.inline().is_some() => {
+                    let merged = postings::merge_inline(&old, buffer, frequencies, positions, |s| sources.length(s));
+                    postings::encode_unit(NO_RECORD, 0, &merged, frequencies, positions, base, &mut records, &mut scratch)
+                }
+                Some(old) => postings::encode_unit(old.head(), old.count, buffer, frequencies, positions, base, &mut records, &mut scratch),
+            }
+        })?;
 
         debug_assert_eq!(self.postings_blob.len(), w.meta.postings_length);
         self.postings_blob.append(&records)?;
@@ -290,19 +299,6 @@ impl<K: Codec, U: Codec> Index<K, U> {
     }
 }
 
-/// A unit's postings: where its chain starts, and how many sources it lists.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnitPostings {
-    pub head: u64,
-    pub count: u64,
-}
-
-impl UnitPostings {
-    fn decode(value: &[u8]) -> UnitPostings {
-        UnitPostings { head: u64::from_le_bytes(value[0..8].try_into().unwrap()), count: u64::from_le_bytes(value[8..16].try_into().unwrap()) }
-    }
-}
-
 /// The index as of a commit.
 pub struct Snapshot<K, U> {
     dict: ReadTxn,
@@ -332,9 +328,20 @@ impl<K: Codec, U: Codec> Snapshot<K, U> {
     }
 
     pub fn unit(&self, unit: &U) -> Option<UnitPostings> {
-        let mut key = vec![UNIT_TAG];
-        unit.encode(&mut key);
-        self.dict.get(&key).map(|v| UnitPostings::decode(&v))
+        let mut key = Vec::new();
+        self.encode_unit(unit, &mut key);
+        self.encoded_unit(&key)
+    }
+
+    /// Appends a unit's dictionary key.
+    pub(crate) fn encode_unit(&self, unit: &U, out: &mut Vec<u8>) {
+        out.push(UNIT_TAG);
+        unit.encode(out);
+    }
+
+    /// A unit's postings, by its dictionary key.
+    pub(crate) fn encoded_unit(&self, key: &[u8]) -> Option<UnitPostings> {
+        self.dict.get(key).map(|v| UnitPostings::decode(&v))
     }
 
     /// Units in a range, in order, with their postings.
@@ -395,5 +402,38 @@ impl<K: Codec, U: Codec> Snapshot<K, U> {
             position += varint::read(map, &mut at) as u32;
             out.push(position);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_unit_is_inline_until_its_entries_outgrow_its_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let index: Index<u32, String> = Index::open(dir.path(), Options::default()).unwrap();
+        let unit = "rare".to_string();
+        let form = |index: &Index<u32, String>| {
+            let p = index.snapshot().unit(&unit).unwrap();
+            (p.count, p.inline().is_some(), p.head() != NO_RECORD && index.snapshot().postings.previous(p.head()) != NO_RECORD)
+        };
+        index.add(&0, [(unit.clone(), 0)]);
+        index.commit().unwrap();
+        assert_eq!(form(&index), (1, true, false));
+        index.add(&1, [(unit.clone(), 3)]);
+        index.commit().unwrap();
+        assert_eq!(form(&index), (2, true, false), "merged inline");
+        for s in 2..10 {
+            index.add(&s, [(unit.clone(), 1)]);
+        }
+        index.commit().unwrap();
+        assert_eq!(form(&index), (10, false, false), "moved to one record");
+        index.add(&10, [(unit.clone(), 1)]);
+        index.commit().unwrap();
+        assert_eq!(form(&index), (11, false, true), "a chain");
+        // a chained unit's dictionary value is a few bytes (count and head as varints), not 16
+        let value = index.dict.begin_read().get(b"\x01rare").unwrap().into_owned();
+        assert!(value.len() <= 4, "{value:?}");
     }
 }

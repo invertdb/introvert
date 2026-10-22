@@ -51,16 +51,16 @@ fn postings_hold_exactly_what_was_added() {
         let added = &built.expected[unit];
         let postings = snapshot.unit(&unit.to_string()).unwrap();
         assert_eq!(postings.count, added.len() as u64, "{unit}");
-        let decoded = snapshot.postings.decode(postings.head);
-        assert_eq!(snapshot.postings.first_source(postings.head), Some(added[0].0), "{unit}: first source");
+        let decoded = snapshot.postings.decode(&postings);
+        assert_eq!(snapshot.postings.first_source(&postings), Some(added[0].0), "{unit}: first source");
         assert_eq!(decoded.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>(), *added, "{unit}: decode");
 
         let mut set = SourceSet::new(20_000);
-        snapshot.postings.add_sources_to(postings.head, &mut set);
+        snapshot.postings.add_sources_to(&postings, &mut set);
         assert_eq!(set.iter().collect::<Vec<_>>(), added.iter().map(|a| a.0).collect::<Vec<_>>(), "{unit}: sources");
 
         // advance to increasing targets: the first entry at or after each
-        let mut cursor = snapshot.postings.cursor(postings.head);
+        let mut cursor = snapshot.postings.cursor(&postings);
         let mut target = 0u32;
         loop {
             target += rng.random_range(1..600);
@@ -75,7 +75,7 @@ fn postings_hold_exactly_what_was_added() {
         }
 
         // positions point at where the unit is
-        let mut cursor = snapshot.postings.cursor(postings.head);
+        let mut cursor = snapshot.postings.cursor(&postings);
         let mut positions = Vec::new();
         for _ in 0..5 {
             assert!(cursor.next());
@@ -83,6 +83,82 @@ fn postings_hold_exactly_what_was_added() {
             snapshot.positions(offset, cursor.frequency, &mut positions);
             assert_eq!(positions.len() as u32, cursor.frequency);
         }
+    }
+}
+
+#[test]
+fn rare_units_stay_inline_then_move_to_records() {
+    // units in a handful of sources up to a few dozen, added over several commits: inline values, inline ones merged
+    // with new entries, inline ones moving to a record, then chains; under every combination of options
+    for (frequencies, positions) in [(true, true), (true, false), (false, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = Options { frequencies, positions, ..Options::default() };
+        let mut index: Index<u32, String> = Index::open(dir.path(), options).unwrap();
+        let mut rng = StdRng::seed_from_u64(21);
+        // unit -> (source, its positions), in source order
+        let mut expected: BTreeMap<String, Vec<(u32, Vec<u32>)>> = BTreeMap::new();
+        let mut source = 0u32;
+        let check = |index: &Index<u32, String>, expected: &BTreeMap<String, Vec<(u32, Vec<u32>)>>, round: usize| {
+            let snapshot = index.snapshot();
+            let mut found = Vec::new();
+            for (unit, added) in expected {
+                let context = format!("{unit} ({frequencies}, {positions}) round {round}");
+                let postings = snapshot.unit(unit).unwrap();
+                assert_eq!(postings.count, added.len() as u64, "{context}");
+                assert_eq!(snapshot.postings.first_source(&postings), Some(added[0].0), "{context}");
+                let frequency = |p: &Vec<u32>| if frequencies { p.len() as u32 } else { 1 };
+                let decoded: Vec<(u32, u32)> = snapshot.postings.decode(&postings).iter().map(|e| (e.0, e.1)).collect();
+                assert_eq!(decoded, added.iter().map(|(s, p)| (*s, frequency(p))).collect::<Vec<_>>(), "{context}");
+                let mut cursor = snapshot.postings.cursor(&postings);
+                for (s, p) in added {
+                    assert!(cursor.next() && cursor.source == *s, "{context}");
+                    if positions {
+                        snapshot.positions(cursor.positions_offset(), cursor.frequency, &mut found);
+                        assert_eq!(&found, p, "{context}: positions in {s}");
+                    }
+                }
+                assert!(!cursor.next(), "{context}: past the end");
+                let mut cursor = snapshot.postings.cursor(&postings);
+                let target = added[added.len() / 2].0;
+                assert!(cursor.advance(target) && cursor.source == target, "{context}: advance");
+                let mut impacts = 0;
+                snapshot.postings.impacts(&postings, |s| snapshot.source_length(s), |_, _| impacts += 1);
+                assert!(impacts >= 1, "{context}: impacts");
+            }
+            // a search ranks the same either way (pruned path vs all)
+            let searcher = Searcher::new(&snapshot, &TfIdf);
+            let clause = Clause::should(expected.keys().take(5).cloned());
+            assert_eq!(searcher.search(&clause, 10).top, searcher.search_all(&clause, 10).top);
+        };
+        for round in 0..6 {
+            for _ in 0..200 {
+                // unit r{n} turns up in about n sources a round (r0 in none, until it's a rare one-off)
+                let mut units: Vec<(String, u32)> = Vec::new();
+                for n in 0..40u32 {
+                    if rng.random_range(0..200) < n.max(1) {
+                        let unit = format!("r{n}");
+                        for _ in 0..rng.random_range(1..4) {
+                            units.push((unit.clone(), units.len() as u32));
+                        }
+                    }
+                }
+                units.push(("filler".to_string(), units.len() as u32));
+                for (unit, position) in &units {
+                    let entries = expected.entry(unit.clone()).or_default();
+                    match entries.last_mut() {
+                        Some((s, p)) if *s == source => p.push(*position),
+                        _ => entries.push((source, vec![*position])),
+                    }
+                }
+                assert_eq!(index.add(&source, units), source);
+                source += 1;
+            }
+            index.commit().unwrap();
+            check(&index, &expected, round);
+        }
+        drop(index);
+        index = Index::open(dir.path(), options).unwrap();
+        check(&index, &expected, 99);
     }
 }
 
@@ -270,7 +346,7 @@ fn snapshots_and_crash_recovery() {
     index.commit().unwrap();
     let snapshot = index.snapshot();
     assert_eq!(snapshot.unit(&x()).unwrap().count, 3);
-    assert_eq!(snapshot.postings.decode(snapshot.unit(&x()).unwrap().head).iter().map(|e| e.0).collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert_eq!(snapshot.postings.decode(&snapshot.unit(&x()).unwrap()).iter().map(|e| e.0).collect::<Vec<_>>(), vec![0, 1, 2]);
     // the empty string is a unit like any other
     index.add(&"e".into(), [(String::new(), 0)]);
     index.commit().unwrap();
@@ -299,6 +375,78 @@ fn alignment_finds_where_a_query_lines_up() {
         assert_eq!(found[0].key, source as u32 + 100);
         assert_eq!(found[0].offset, start as i64 - 1000);
         assert!(found[0].count >= 40 && (found.len() < 2 || found[1].count < 10), "{found:?}");
+    }
+}
+
+#[test]
+fn alignment_matches_voting_by_brute_force() {
+    // align against a reference that votes every (query, source) occurrence pair from decoded postings
+    let dir = tempfile::tempdir().unwrap();
+    let index: Index<u32, u32> = Index::open(dir.path(), Options::default()).unwrap();
+    let mut rng = StdRng::seed_from_u64(31);
+    for key in 0..300u32 {
+        let length = rng.random_range(20..400);
+        // a small alphabet so units repeat within and across sources
+        index.add(&key, (0..length).map(|p| (rng.random_range(0..800u32), p)));
+        if key % 70 == 69 {
+            index.commit().unwrap();
+        }
+    }
+    index.commit().unwrap();
+    let snapshot = index.snapshot();
+    let relevance = TfIdf;
+    let searcher = Searcher::new(&snapshot, &relevance);
+    let reference = |query: &[(u32, u32)], tolerance: i64, depth: usize, max_source_frequency: u64| {
+        let mut by_unit: BTreeMap<u32, Vec<i64>> = BTreeMap::new();
+        for &(u, p) in query {
+            by_unit.entry(u).or_default().push(p as i64);
+        }
+        // source -> (shared, votes)
+        let mut sources: BTreeMap<u32, (u64, Vec<i64>)> = BTreeMap::new();
+        let mut positions = Vec::new();
+        for (u, qs) in &by_unit {
+            let Some(postings) = snapshot.unit(u) else { continue };
+            if max_source_frequency > 0 && postings.count > max_source_frequency {
+                continue;
+            }
+            for (source, frequency, offset) in snapshot.postings.decode(&postings) {
+                let entry = sources.entry(source).or_default();
+                entry.0 += frequency as u64 * qs.len() as u64;
+                snapshot.positions(offset, frequency, &mut positions);
+                for &p in &positions {
+                    entry.1.extend(qs.iter().map(|q| p as i64 - q));
+                }
+            }
+        }
+        let mut ranked: Vec<(u32, u64, Vec<i64>)> = sources.into_iter().map(|(s, (shared, votes))| (s, shared, votes)).collect();
+        if depth > 0 {
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            ranked.truncate(depth);
+        }
+        let mut best: Vec<(u32, u64, u64, i64)> = ranked
+            .into_iter()
+            .map(|(s, shared, mut votes)| {
+                votes.sort();
+                // the lowest offset whose window holds the most votes
+                let (count, offset) = votes.iter().fold((0, 0), |(c, o), &v| {
+                    let n = votes.iter().filter(|&&w| (w - v).abs() <= tolerance).count();
+                    if n > c { (n, v) } else { (c, o) }
+                });
+                (s, shared, count as u64, offset)
+            })
+            .collect();
+        best.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        best
+    };
+    for q in 0..60 {
+        let length = rng.random_range(1..80);
+        let query: Vec<(u32, u32)> = (0..length).map(|i| (rng.random_range(0..800u32), 500 + i * rng.random_range(1..3))).collect();
+        let (tolerance, depth, max_source_frequency) = [(0, 0, 0), (3, 10, 0), (20, 50, 60), (1, 1, 0)][q % 4];
+        let found = searcher.align(&query, 1000, tolerance, depth, max_source_frequency);
+        let expected = reference(&query, tolerance, depth, max_source_frequency);
+        let found: Vec<(u32, u64, u64, i64)> = found.iter().map(|a| (a.source, a.matches, a.count, a.offset)).collect();
+        assert_eq!(found, expected, "query {q}");
+        assert!(searcher.align(&query, 3, tolerance, depth, max_source_frequency).iter().all(|a| a.key == a.source));
     }
 }
 

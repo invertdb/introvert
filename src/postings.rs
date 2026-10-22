@@ -19,6 +19,15 @@
 //! remaining entries as varints (deltas from the last block's last entry) | padding
 //! ```
 //!
+//! A unit's dictionary value ([`UnitPostings`]) holds its count and its newest record, or, for a unit whose entries
+//! fit [`INLINE`] bytes and that has no record yet, the entries themselves (as a small record holds them): a rare unit
+//! then costs no record and no second lookup.
+//!
+//! ```text
+//! chain    count << 1 varint     | newest record offset varint
+//! inline   count << 1 | 1 varint | entries
+//! ```
+//!
 //! Impacts are (frequency, source length) pairs no entry of the record beats on both, bounding what any of its sources
 //! can score. Frequencies and positions are optional per index (flags).
 //!
@@ -36,13 +45,103 @@ pub const BLOCK: usize = 128;
 pub const HEADER: usize = 8;
 pub const MAX_IMPACTS: usize = 8;
 pub const NO_RECORD: u64 = u64::MAX;
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
+/// Most bytes of entries a dictionary value holds inline (what fits [`UnitPostings`] in 32 bytes).
+pub const INLINE: usize = 23;
+const CHAIN: u8 = u8::MAX; // UnitPostings::length when its data holds the newest record's offset
 pub const FLAG_FREQUENCIES: u8 = 1;
 pub const FLAG_POSITIONS: u8 = 2;
 
 pub fn blob_header(frequencies: bool, positions: bool) -> [u8; HEADER] {
     let flags = if frequencies { FLAG_FREQUENCIES } else { 0 } | if positions { FLAG_POSITIONS } else { 0 };
     [b'I', b'V', b'P', b'T', VERSION, flags, 0, 0]
+}
+
+/// A unit's postings: how many sources list it, and where its chain of records starts or its entries inline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UnitPostings {
+    pub count: u64,
+    data: [u8; INLINE], // the entries (`length` bytes), or the newest record's offset (length CHAIN)
+    length: u8,
+}
+
+impl UnitPostings {
+    pub(crate) fn decode(value: &[u8]) -> UnitPostings {
+        let mut at = 0;
+        let tagged = varint::read(value, &mut at);
+        let mut unit = UnitPostings { count: tagged >> 1, data: [0; INLINE], length: CHAIN };
+        if tagged & 1 == 1 {
+            let entries = &value[at..];
+            unit.length = entries.len() as u8;
+            unit.data[..entries.len()].copy_from_slice(entries);
+        } else {
+            unit.data[..8].copy_from_slice(&varint::read(value, &mut at).to_le_bytes());
+        }
+        unit
+    }
+
+    /// The newest record of the unit's chain (NO_RECORD if its entries are inline).
+    pub(crate) fn head(&self) -> u64 {
+        if self.length == CHAIN { u64::from_le_bytes(self.data[..8].try_into().unwrap()) } else { NO_RECORD }
+    }
+
+    /// The entries, if the dictionary value holds them.
+    pub(crate) fn inline(&self) -> Option<&[u8]> {
+        (self.length != CHAIN).then(|| &self.data[..self.length as usize])
+    }
+
+    /// Identifies the postings (equal keys, equal postings), for caching what they match.
+    pub(crate) fn key(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.push(self.length);
+        out.extend_from_slice(&self.data[..if self.length == CHAIN { 8 } else { self.length as usize }]);
+    }
+}
+
+/// Encodes a unit's new entries (`buffer`, after `prior` older ones whose newest record is `previous`) and returns its
+/// dictionary value: the entries inline if the unit has no record and they fit, else a record appended to `records`,
+/// which starts at offset `base` in the blob. `scratch` is reused between calls.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_unit(previous: u64, prior: u64, buffer: &Buffer, frequencies: bool, positions: bool, base: u64, records: &mut Vec<u8>, scratch: &mut Vec<u8>) -> Vec<u8> {
+    let count = prior + buffer.sources.len() as u64;
+    let mut value = Vec::with_capacity(12);
+    if previous == NO_RECORD && buffer.sources.len() <= INLINE {
+        scratch.clear();
+        encode_entries(buffer, frequencies, positions, scratch);
+        if scratch.len() <= INLINE {
+            varint::write(&mut value, count << 1 | 1);
+            value.extend_from_slice(scratch);
+            return value;
+        }
+    }
+    varint::write(&mut value, count << 1);
+    varint::write(&mut value, base + records.len() as u64);
+    encode_record(previous, buffer, frequencies, positions, records);
+    value
+}
+
+/// A unit's inline entries followed by new ones (`buffer`, of later sources) as one buffer; `length` gives a source's
+/// length, for the impacts.
+pub fn merge_inline(unit: &UnitPostings, buffer: &Buffer, frequencies: bool, positions: bool, length: impl Fn(u32) -> u32) -> Buffer {
+    let mut merged = Buffer::default();
+    small_entries(unit.inline().unwrap(), 0, unit.count as usize, frequencies, positions, |s, f, o| merged.push(s, f, o, length(s)));
+    for i in 0..buffer.sources.len() {
+        merged.push(buffer.sources[i], buffer.frequencies[i], buffer.positions[i], length(buffer.sources[i]));
+    }
+    merged
+}
+
+/// Reads `count` small-record entries from `at`: (source, frequency, positions offset) each.
+fn small_entries(bytes: &[u8], mut at: usize, count: usize, frequencies: bool, positions: bool, mut entry: impl FnMut(u32, u32, u64)) {
+    let (mut source, mut offset) = (0u32, 0u64);
+    for _ in 0..count {
+        source += varint::read(bytes, &mut at) as u32;
+        let f = if frequencies { varint::read(bytes, &mut at) as u32 } else { 1 };
+        if positions {
+            offset += varint::read(bytes, &mut at);
+        }
+        entry(source, f, offset);
+    }
 }
 
 fn index_entry(positions: bool) -> usize {
@@ -103,6 +202,22 @@ impl Buffer {
     }
 }
 
+/// A small record's entries (at most [`BLOCK`]): varints, each a delta from the entry before (the first from 0).
+pub fn encode_entries(buffer: &Buffer, frequencies: bool, positions: bool, out: &mut Vec<u8>) {
+    let (mut source, mut offset) = (0u32, 0u64);
+    for i in 0..buffer.sources.len() {
+        varint::write(out, (buffer.sources[i] - source) as u64);
+        if frequencies {
+            varint::write(out, buffer.frequencies[i] as u64);
+        }
+        if positions {
+            varint::write(out, buffer.positions[i] - offset);
+        }
+        source = buffer.sources[i];
+        offset = buffer.positions[i];
+    }
+}
+
 /// Encodes a record (everything from the previous-record offset on).
 pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, positions: bool, out: &mut Vec<u8>) {
     let count = buffer.sources.len();
@@ -124,7 +239,7 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
         }
     };
     if count <= BLOCK {
-        write_varints(out, 0, 0, 0);
+        encode_entries(buffer, frequencies, positions, out);
         return;
     }
 
@@ -144,7 +259,8 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
     let mut values = [0u64; BLOCK];
     for b in 0..blocks {
         let first = b * BLOCK;
-        let base_source = if b == 0 { sources[0] - 1 } else { sources[first - 1] };
+        // the first block's deltas start from one before its first source (wrapping, as decoding does, for source 0)
+        let base_source = if b == 0 { sources[0].wrapping_sub(1) } else { sources[first - 1] };
         let base_offset = if b == 0 { offsets[0] } else { offsets[first - 1] };
         index.extend_from_slice(&sources[first + BLOCK - 1].to_le_bytes());
         index.extend_from_slice(&(data.len() as u32).to_le_bytes());
@@ -155,7 +271,7 @@ pub fn encode_record(previous: u64, buffer: &Buffer, frequencies: bool, position
         }
 
         for i in 0..BLOCK {
-            values[i] = (sources[first + i] - if i == 0 { base_source } else { sources[first + i - 1] }) as u64;
+            values[i] = sources[first + i].wrapping_sub(if i == 0 { base_source } else { sources[first + i - 1] }) as u64;
         }
         let source_width = bitpack::width(values.iter().copied().max().unwrap());
         let mut freq_values = [0u64; BLOCK];
@@ -216,13 +332,17 @@ impl Postings {
         &self.map
     }
 
-    fn previous(&self, record: u64) -> u64 {
+    pub(crate) fn previous(&self, record: u64) -> u64 {
         u64::from_le_bytes(self.bytes()[record as usize..record as usize + 8].try_into().unwrap())
     }
 
-    /// The records of a chain, oldest first (no allocation for the common chain of one record).
-    fn chain(&self, head: u64) -> Records {
-        if head != NO_RECORD && self.previous(head) == NO_RECORD {
+    /// The records of a unit's chain, oldest first (no allocation for the common chain of one record).
+    fn chain(&self, unit: &UnitPostings) -> Records {
+        if unit.inline().is_some() {
+            return Records::Inline;
+        }
+        let head = unit.head();
+        if self.previous(head) == NO_RECORD {
             return Records::One(head);
         }
         let mut records = Vec::new();
@@ -261,23 +381,15 @@ impl Postings {
         }
     }
 
-    /// How many sources the chain at `head` lists (record headers only).
-    pub fn count(&self, head: u64) -> u64 {
-        let mut total = 0;
-        let mut record = head;
-        while record != NO_RECORD {
-            let mut at = record as usize + 8;
-            total += varint::read(self.bytes(), &mut at);
-            record = self.previous(record);
-        }
-        total
-    }
-
     /// (frequency, source length) pairs that together bound every entry of the chain: a packed record's impacts, or
     /// each entry of a smaller one (`length` gives a source's length).
-    pub fn impacts(&self, head: u64, length: impl Fn(u32) -> u32, mut impact: impl FnMut(u32, u32)) {
+    pub fn impacts(&self, unit: &UnitPostings, length: impl Fn(u32) -> u32, mut impact: impl FnMut(u32, u32)) {
+        if let Some(entries) = unit.inline() {
+            small_entries(entries, 0, unit.count as usize, self.frequencies, self.positions, |s, f, _| impact(f, length(s)));
+            return;
+        }
         let bytes = self.bytes();
-        let mut record = head;
+        let mut record = unit.head();
         while record != NO_RECORD {
             let mut at = record as usize + 8;
             let count = varint::read(bytes, &mut at) as usize;
@@ -291,24 +403,19 @@ impl Postings {
                     impact(f, varint::read(bytes, &mut at) as u32);
                 }
             } else {
-                let mut source = 0u32;
-                for _ in 0..count {
-                    source += varint::read(bytes, &mut at) as u32;
-                    let f = if self.frequencies { varint::read(bytes, &mut at) as u32 } else { 1 };
-                    if self.positions {
-                        varint::read(bytes, &mut at);
-                    }
-                    impact(f, length(source));
-                }
+                small_entries(bytes, at, count, self.frequencies, self.positions, |s, f, _| impact(f, length(s)));
             }
             record = self.previous(record);
         }
     }
 
-    /// The chain's first (smallest) source, from its oldest record's header alone: in either layout, the first
+    /// The unit's first (smallest) source, from its oldest record's header alone: in either layout, the first
     /// value after the entry count (a packed record's first source, or a small record's first delta from 0).
-    pub fn first_source(&self, head: u64) -> Option<u32> {
-        let oldest = self.chain(head).first()?;
+    pub fn first_source(&self, unit: &UnitPostings) -> Option<u32> {
+        if let Some(entries) = unit.inline() {
+            return Some(varint::read(entries, &mut 0) as u32);
+        }
+        let oldest = self.chain(unit).first()?;
         let mut at = oldest as usize + 8;
         if varint::read(self.bytes(), &mut at) == 0 {
             return None;
@@ -316,28 +423,31 @@ impl Postings {
         Some(varint::read(self.bytes(), &mut at) as u32)
     }
 
-    /// Adds every source of the chain to a set.
-    pub fn add_sources_to(&self, head: u64, set: &mut SourceSet) {
-        let mut cursor = self.cursor(head);
+    /// Adds every source of the unit's postings to a set.
+    pub fn add_sources_to(&self, unit: &UnitPostings, set: &mut SourceSet) {
+        let mut cursor = self.cursor(unit);
         while cursor.next() {
             set.insert(cursor.source);
         }
     }
 
-    /// Every entry of the chain: (source, frequency, positions offset).
-    pub fn decode(&self, head: u64) -> Vec<(u32, u32, u64)> {
+    /// Every entry of the unit's postings: (source, frequency, positions offset).
+    pub fn decode(&self, unit: &UnitPostings) -> Vec<(u32, u32, u64)> {
         let mut out = Vec::new();
-        let mut cursor = self.cursor(head);
+        let mut cursor = self.cursor(unit);
         while cursor.next() {
             out.push((cursor.source, cursor.frequency, cursor.positions_offset()));
         }
         out
     }
 
-    pub fn cursor(&self, head: u64) -> Cursor<'_> {
+    pub fn cursor(&self, unit: &UnitPostings) -> Cursor<'_> {
         Cursor {
             postings: self,
-            records: self.chain(head),
+            records: self.chain(unit),
+            inline: unit.data,
+            inline_count: unit.count as usize,
+            reading_inline: false,
             record: usize::MAX,
             packed: false,
             view: Packed::default(),
@@ -356,16 +466,17 @@ impl Postings {
     }
 }
 
-/// A chain's records, oldest first.
+/// A chain's records, oldest first (or the unit's entries, inline: as one record).
 enum Records {
     One(u64),
     Many(Vec<u64>),
+    Inline,
 }
 
 impl Records {
     fn len(&self) -> usize {
         match self {
-            Records::One(_) => 1,
+            Records::One(_) | Records::Inline => 1,
             Records::Many(r) => r.len(),
         }
     }
@@ -374,6 +485,7 @@ impl Records {
         match self {
             Records::One(r) => *r,
             Records::Many(r) => r[i],
+            Records::Inline => unreachable!("inline entries have no record"),
         }
     }
 
@@ -381,6 +493,7 @@ impl Records {
         match self {
             Records::One(r) => Some(*r),
             Records::Many(r) => r.first().copied(),
+            Records::Inline => None,
         }
     }
 }
@@ -394,6 +507,9 @@ pub const NO_MORE: u32 = u32::MAX;
 pub struct Cursor<'a> {
     postings: &'a Postings,
     records: Records,
+    inline: [u8; INLINE],
+    inline_count: usize,
+    reading_inline: bool, // the varints come from `inline`, not the blob
     record: usize,
     packed: bool,
     view: Packed,
@@ -591,7 +707,7 @@ impl<'a> Cursor<'a> {
 
     #[inline]
     fn read_varint(&mut self) {
-        let bytes = self.postings.bytes();
+        let bytes = if self.reading_inline { &self.inline[..] } else { self.postings.bytes() };
         let base = if self.source == NOT_STARTED { 0 } else { self.source };
         self.source = base + varint::read(bytes, &mut self.at) as u32;
         self.frequency = if self.postings.frequencies { varint::read(bytes, &mut self.at) as u32 } else { 1 };
@@ -607,10 +723,17 @@ impl<'a> Cursor<'a> {
             self.source = NO_MORE;
             return false;
         }
-        let mut at = self.records.get(self.record) as usize + 8;
-        let count = varint::read(self.postings.bytes(), &mut at) as usize;
         self.source = NOT_STARTED; // deltas restart in each record
         self.running_offset = 0;
+        if let Records::Inline = self.records {
+            self.reading_inline = true;
+            self.packed = false;
+            self.at = 0;
+            self.remaining = self.inline_count;
+            return true;
+        }
+        let mut at = self.records.get(self.record) as usize + 8;
+        let count = varint::read(self.postings.bytes(), &mut at) as usize;
         self.packed = count > BLOCK;
         if self.packed {
             self.view = self.postings.packed(at, count);

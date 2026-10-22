@@ -76,7 +76,7 @@ impl<U: Codec> Match<U> {
             Match::Postings(parts) => {
                 key.push(4);
                 for p in parts {
-                    key.extend_from_slice(&p.head.to_le_bytes());
+                    p.key(&mut key);
                 }
             }
         }
@@ -176,7 +176,7 @@ pub struct Searcher<'s, K, U, R> {
     snapshot: &'s Snapshot<K, U>,
     relevance: &'s R,
     max_expansion: usize,
-    bounds: RefCell<HashMap<u64, f64>>,
+    bounds: RefCell<HashMap<UnitPostings, f64>>,
 }
 
 /// A scored source, before its key is decoded.
@@ -294,68 +294,89 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
     /// sources (0: no limit) are skipped: they add many votes and little evidence.
     pub fn align(&self, query: &[(U, u32)], top: usize, tolerance: i64, depth: usize, max_source_frequency: u64) -> Vec<Alignment<K>> {
         let snapshot = self.snapshot;
-        let mut positions: HashMap<Vec<u8>, (UnitPostings, Vec<i64>)> = HashMap::new();
+        // the query's units, encoded into one buffer and sorted: each distinct unit is looked up once
+        let mut encoded = Vec::new();
+        let mut spans: Vec<(usize, usize, i64)> = Vec::with_capacity(query.len());
         for (unit, position) in query {
-            let key = unit.to_bytes();
-            if let Some(entry) = positions.get_mut(&key) {
-                entry.1.push(*position as i64);
-            } else if let Some(postings) = snapshot.unit(unit)
+            let start = encoded.len();
+            snapshot.encode_unit(unit, &mut encoded);
+            spans.push((start, encoded.len(), *position as i64));
+        }
+        spans.sort_unstable_by(|a, b| encoded[a.0..a.1].cmp(&encoded[b.0..b.1]));
+        // per distinct unit found: its query positions (a range of `query_positions`)
+        let mut units: Vec<(UnitPostings, usize, usize)> = Vec::new();
+        let mut query_positions: Vec<i64> = Vec::with_capacity(spans.len());
+        let mut i = 0;
+        while i < spans.len() {
+            let key = &encoded[spans[i].0..spans[i].1];
+            let end = i + spans[i..].iter().take_while(|s| &encoded[s.0..s.1] == key).count();
+            if let Some(postings) = snapshot.encoded_unit(key)
                 && (max_source_frequency == 0 || postings.count <= max_source_frequency)
             {
-                positions.insert(key, (postings, vec![*position as i64]));
+                let first = query_positions.len();
+                query_positions.extend(spans[i..end].iter().map(|s| s.2));
+                units.push((postings, first, query_positions.len()));
             }
+            i = end;
         }
-        let units: Vec<(UnitPostings, Vec<i64>)> = positions.into_values().collect();
 
-        // pass 1: occurrences each source shares with the query
-        let mut shared: HashMap<u32, u64> = HashMap::new();
-        for (postings, query_positions) in &units {
-            let mut cursor = snapshot.postings.cursor(postings.head);
+        // every entry of those units, (source, unit, frequency, positions offset), grouped by source
+        let mut entries: Vec<(u32, u32, u32, u64)> = Vec::new();
+        for (u, (postings, _, _)) in units.iter().enumerate() {
+            let mut cursor = snapshot.postings.cursor(postings);
             while cursor.next() {
-                *shared.entry(cursor.source).or_default() += cursor.frequency as u64 * query_positions.len() as u64;
+                entries.push((cursor.source, u as u32, cursor.frequency, cursor.positions_offset()));
             }
         }
-        let mut candidates: Vec<u32> = shared.keys().copied().collect();
+        entries.sort_unstable_by_key(|e| (e.0, e.1));
+
+        // pass 1: occurrences each source shares with the query, from postings alone; the `depth` sharing the most
+        // are candidates: (shared, source, its entries)
+        let mut candidates: Vec<(u64, u32, usize, usize)> = Vec::new();
+        let mut start = 0;
+        while start < entries.len() {
+            let source = entries[start].0;
+            let mut end = start;
+            let mut shared = 0u64;
+            while end < entries.len() && entries[end].0 == source {
+                let (_, first, last) = units[entries[end].1 as usize];
+                shared += entries[end].2 as u64 * (last - first) as u64;
+                end += 1;
+            }
+            candidates.push((shared, source, start, end));
+            start = end;
+        }
+        let rank = |a: &(u64, u32, usize, usize), b: &(u64, u32, usize, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
         if depth > 0 && candidates.len() > depth {
-            candidates.sort_by(|a, b| shared[b].cmp(&shared[a]).then(a.cmp(b)));
+            candidates.select_nth_unstable_by(depth - 1, rank);
             candidates.truncate(depth);
         }
-        let slot: HashMap<u32, u32> = candidates.iter().enumerate().map(|(i, &s)| (s, i as u32)).collect();
 
-        // pass 2: (candidate, offset) votes, packed so one sort groups them
-        let mut votes: Vec<u64> = Vec::new();
+        // pass 2: per candidate, a vote for each pair of a query and a source occurrence (the offset between them);
+        // the window [offset - tolerance, offset + tolerance] with the most votes wins
+        let mut best: Vec<(u32, u64, u64, i64)> = Vec::with_capacity(candidates.len()); // (source, shared, count, offset)
+        let mut votes: Vec<i64> = Vec::new();
         let mut source_positions = Vec::new();
-        for (postings, query_positions) in &units {
-            let mut cursor = snapshot.postings.cursor(postings.head);
-            while cursor.next() {
-                let Some(&candidate) = slot.get(&cursor.source) else { continue };
-                let frequency = cursor.frequency;
-                snapshot.positions(cursor.positions_offset(), frequency, &mut source_positions);
+        for &(shared, source, start, end) in &candidates {
+            votes.clear();
+            for &(_, u, frequency, offset) in &entries[start..end] {
+                let (_, first, last) = units[u as usize];
+                snapshot.positions(offset, frequency, &mut source_positions);
                 for &p in &source_positions {
-                    for &q in query_positions {
-                        votes.push(((candidate as u64) << 32) | ((p as i64 - q) as i32 as u32 ^ 0x8000_0000) as u64);
-                    }
+                    votes.extend(query_positions[first..last].iter().map(|&q| p as i64 - q));
                 }
             }
-        }
-        votes.sort_unstable();
-        let offset_of = |vote: u64| (vote as u32 ^ 0x8000_0000) as i32 as i64;
-
-        // per candidate, the offset window [offset - tolerance, offset + tolerance] with the most votes
-        let mut best: Vec<Alignment<K>> = Vec::new();
-        let mut start = 0;
-        while start < votes.len() {
-            let candidate = (votes[start] >> 32) as usize;
-            let end = start + votes[start..].iter().take_while(|&&v| (v >> 32) as usize == candidate).count();
-            let source = candidates[candidate];
+            if votes.is_empty() {
+                continue;
+            }
+            votes.sort_unstable();
             let (mut count, mut offset) = (0usize, 0i64);
-            let (mut low, mut high) = (start, start);
-            for i in start..end {
-                let o = offset_of(votes[i]);
-                while offset_of(votes[low]) < o - tolerance {
+            let (mut low, mut high) = (0, 0);
+            for &o in &votes {
+                while votes[low] < o - tolerance {
                     low += 1;
                 }
-                while high < end && offset_of(votes[high]) <= o + tolerance {
+                while high < votes.len() && votes[high] <= o + tolerance {
                     high += 1;
                 }
                 if high - low > count {
@@ -363,12 +384,11 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
                     offset = o;
                 }
             }
-            best.push(Alignment { source, key: snapshot.key(source), matches: shared[&source], count: count as u64, offset });
-            start = end;
+            best.push((source, shared, count as u64, offset));
         }
-        best.sort_by(|a, b| b.count.cmp(&a.count).then(a.source.cmp(&b.source)));
+        best.sort_unstable_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
         best.truncate(top);
-        best
+        best.into_iter().map(|(source, matches, count, offset)| Alignment { source, key: snapshot.key(source), matches, count, offset }).collect()
     }
 
     /// The sources matching a clause, unranked.
@@ -413,16 +433,16 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
     }
 
     fn bound(&self, unit: UnitPostings, weight: f64) -> f64 {
-        if let Some(&b) = self.bounds.borrow().get(&unit.head) {
+        if let Some(&b) = self.bounds.borrow().get(&unit) {
             return b;
         }
         let snapshot = self.snapshot;
         let average = snapshot.average_length();
         let mut highest = 0.0f64;
-        snapshot.postings.impacts(unit.head, |s| snapshot.source_length(s), |f, l| {
+        snapshot.postings.impacts(&unit, |s| snapshot.source_length(s), |f, l| {
             highest = highest.max(self.relevance.score(weight, f, self.relevance.norm(l, average)));
         });
-        self.bounds.borrow_mut().insert(unit.head, highest);
+        self.bounds.borrow_mut().insert(unit, highest);
         highest
     }
 
@@ -455,7 +475,7 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
             let Some(&part) = parts.first() else { continue };
             let weight = relevance.weight(part.count, n_sources);
             let bound = self.bound(part, weight);
-            let mut cursor = snapshot.postings.cursor(part.head);
+            let mut cursor = snapshot.postings.cursor(&part);
             cursor.next();
             cursors.push(Cursored { order, weight, bound, cursor, known: false, highest: 0, shortest: 0 });
         }
@@ -601,7 +621,7 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
         if data.entries.is_none() {
             let mut entries: Vec<(u32, u32, u64)> = Vec::new();
             for part in &data.parts {
-                entries.extend(postings.decode(part.head));
+                entries.extend(postings.decode(part));
             }
             if data.parts.len() > 1 {
                 entries.sort_by_key(|e| e.0);
@@ -626,7 +646,7 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
         match &data.entries {
             Some(entries) => entries.iter().for_each(|e| set.insert(e.0)),
             // only the sources are needed: read them straight into the set, without decoding entries
-            None => data.parts.iter().for_each(|part| snapshot.postings.add_sources_to(part.head, &mut set)),
+            None => data.parts.iter().for_each(|part| snapshot.postings.add_sources_to(part, &mut set)),
         }
         set
     }
@@ -660,7 +680,7 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
                         let data = self.data(unit_match);
                         if data.entries.is_none() && data.parts.len() <= CURSOR_PARTS && data.estimate > 8 * left {
                             let postings = &snapshot.postings;
-                            let mut cursors: Vec<_> = data.parts.iter().map(|p| postings.cursor(p.head)).collect();
+                            let mut cursors: Vec<_> = data.parts.iter().map(|p| postings.cursor(p)).collect();
                             let mut kept = SourceSet::new(n);
                             for source in a.iter() {
                                 if cursors.iter_mut().any(|c| c.advance(source) && c.source == source) {
@@ -708,7 +728,7 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
             let snapshot = self.searcher.snapshot;
             let data = self.data(unit_match);
             if data.entries.is_none() && data.parts.len() <= CURSOR_PARTS && data.estimate > 8 * left {
-                let mut cursors: Vec<_> = data.parts.iter().map(|p| snapshot.postings.cursor(p.head)).collect();
+                let mut cursors: Vec<_> = data.parts.iter().map(|p| snapshot.postings.cursor(p)).collect();
                 let present: Vec<u32> = result.iter().collect();
                 for source in present {
                     if cursors.iter_mut().any(|c| c.advance(source) && c.source == source) {
