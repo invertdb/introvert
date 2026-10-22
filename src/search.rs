@@ -74,6 +74,7 @@ impl<U: Codec> Match<U> {
                 }
             }
             Match::Postings(parts) => {
+                key.reserve(1 + 9 * parts.len());
                 key.push(4);
                 for p in parts {
                     p.key(&mut key);
@@ -466,16 +467,20 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
         let relevance = self.relevance;
         let average = snapshot.average_length();
         let n_sources = snapshot.source_count() as u64;
-        let mut cursors: Vec<Cursored> = Vec::new();
+        // each match's one unit (the cursors borrow them)
+        let mut parts: Vec<(usize, UnitPostings)> = Vec::new();
         for (order, unit_match) in unit_matches.iter().enumerate() {
-            let parts = self.expand(unit_match);
-            if parts.len() > 1 {
+            let expanded = self.expand(unit_match);
+            if expanded.len() > 1 {
                 return None;
             }
-            let Some(&part) = parts.first() else { continue };
+            parts.extend(expanded.first().map(|&part| (order, part)));
+        }
+        let mut cursors: Vec<Cursored> = Vec::new();
+        for &(order, ref part) in &parts {
             let weight = relevance.weight(part.count, n_sources);
-            let bound = self.bound(part, weight);
-            let mut cursor = snapshot.postings.cursor(&part);
+            let bound = self.bound(*part, weight);
+            let mut cursor = snapshot.postings.cursor(part);
             cursor.next();
             cursors.push(Cursored { order, weight, bound, cursor, known: false, highest: 0, shortest: 0 });
         }
@@ -652,8 +657,9 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
     }
 
     fn count(&mut self, unit_match: &Match<U>) -> u64 {
-        if self.data(unit_match).parts.len() <= 1 {
-            return self.data(unit_match).estimate;
+        let data = self.data(unit_match);
+        if data.parts.len() <= 1 {
+            return data.estimate;
         }
         self.entries(unit_match).len() as u64
     }
@@ -663,11 +669,12 @@ impl<'q, 's, K: Codec, U: Codec + Clone, R: Relevance> Query<'q, 's, K, U, R> {
         let mut result: SourceSet;
         if !clause.must.is_empty() || !clause.must_clauses.is_empty() {
             // smallest first, and stop once nothing can match
-            let mut musts: Vec<&Match<U>> = clause.must.iter().collect();
-            musts.sort_by_key(|t| self.data(t).estimate);
-            if musts.first().is_some_and(|t| self.data(t).estimate == 0) {
+            let mut musts: Vec<(u64, &Match<U>)> = clause.must.iter().map(|t| (self.data(t).estimate, t)).collect();
+            musts.sort_by_key(|t| t.0);
+            if musts.first().is_some_and(|t| t.0 == 0) {
                 return SourceSet::new(n);
             }
+            let musts = musts.into_iter().map(|t| t.1);
             let mut acc: Option<SourceSet> = None;
             for unit_match in musts {
                 match &mut acc {

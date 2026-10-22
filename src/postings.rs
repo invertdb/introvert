@@ -91,8 +91,9 @@ impl UnitPostings {
     }
 
     /// Identifies the postings (equal keys, equal postings), for caching what they match.
+    /// A chain is its head; inline entries are their bytes (which determine the count).
+    #[inline]
     pub(crate) fn key(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.count.to_le_bytes());
         out.push(self.length);
         out.extend_from_slice(&self.data[..if self.length == CHAIN { 8 } else { self.length as usize }]);
     }
@@ -425,6 +426,11 @@ impl Postings {
 
     /// Adds every source of the unit's postings to a set.
     pub fn add_sources_to(&self, unit: &UnitPostings, set: &mut SourceSet) {
+        if let Some(entries) = unit.inline() {
+            // read in place: a cursor would cost more to set up than these few entries do to read
+            small_entries(entries, 0, unit.count as usize, self.frequencies, self.positions, |s, _, _| set.insert(s));
+            return;
+        }
         let mut cursor = self.cursor(unit);
         while cursor.next() {
             set.insert(cursor.source);
@@ -434,6 +440,11 @@ impl Postings {
     /// Every entry of the unit's postings: (source, frequency, positions offset).
     pub fn decode(&self, unit: &UnitPostings) -> Vec<(u32, u32, u64)> {
         let mut out = Vec::new();
+        if let Some(entries) = unit.inline() {
+            out.reserve(unit.count as usize);
+            small_entries(entries, 0, unit.count as usize, self.frequencies, self.positions, |s, f, o| out.push((s, f, o)));
+            return out;
+        }
         let mut cursor = self.cursor(unit);
         while cursor.next() {
             out.push((cursor.source, cursor.frequency, cursor.positions_offset()));
@@ -441,13 +452,14 @@ impl Postings {
         out
     }
 
-    pub fn cursor(&self, unit: &UnitPostings) -> Cursor<'_> {
+    /// A cursor over the unit's postings (which it borrows: inline entries are read where they are).
+    pub fn cursor<'a>(&'a self, unit: &'a UnitPostings) -> Cursor<'a> {
         Cursor {
             postings: self,
             records: self.chain(unit),
-            inline: unit.data,
+            inline: unit.inline().unwrap_or(&[]),
             inline_count: unit.count as usize,
-            reading_inline: false,
+            varints: self.bytes(),
             record: usize::MAX,
             packed: false,
             view: Packed::default(),
@@ -507,9 +519,9 @@ pub const NO_MORE: u32 = u32::MAX;
 pub struct Cursor<'a> {
     postings: &'a Postings,
     records: Records,
-    inline: [u8; INLINE],
+    inline: &'a [u8],
     inline_count: usize,
-    reading_inline: bool, // the varints come from `inline`, not the blob
+    varints: &'a [u8], // where the current record's varints are: the blob, or the inline entries
     record: usize,
     packed: bool,
     view: Packed,
@@ -707,7 +719,7 @@ impl<'a> Cursor<'a> {
 
     #[inline]
     fn read_varint(&mut self) {
-        let bytes = if self.reading_inline { &self.inline[..] } else { self.postings.bytes() };
+        let bytes = self.varints;
         let base = if self.source == NOT_STARTED { 0 } else { self.source };
         self.source = base + varint::read(bytes, &mut self.at) as u32;
         self.frequency = if self.postings.frequencies { varint::read(bytes, &mut self.at) as u32 } else { 1 };
@@ -726,7 +738,7 @@ impl<'a> Cursor<'a> {
         self.source = NOT_STARTED; // deltas restart in each record
         self.running_offset = 0;
         if let Records::Inline = self.records {
-            self.reading_inline = true;
+            self.varints = self.inline;
             self.packed = false;
             self.at = 0;
             self.remaining = self.inline_count;
