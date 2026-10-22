@@ -197,6 +197,17 @@ impl Buffer {
         impacts.remove(merge + 1);
     }
 
+    /// Empties the buffer, keeping its allocations.
+    pub fn clear(&mut self) {
+        self.sources.clear();
+        self.frequencies.clear();
+        self.positions.clear();
+        self.impacts.clear();
+        self.block_maxima.clear();
+        self.block_highest = 0;
+        self.block_shortest = 0;
+    }
+
     /// Bytes the buffer holds (for flushing by size).
     pub fn bytes(&self) -> usize {
         self.sources.len() * 16 + self.impacts.len() * 8

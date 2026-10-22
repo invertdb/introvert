@@ -66,9 +66,58 @@ impl Meta {
     }
 }
 
+/// A unit's dictionary key while it's buffered: short keys (most) inline, without an allocation of their own.
+#[derive(Clone, PartialEq, Eq)]
+enum UnitKey {
+    Inline { length: u8, bytes: [u8; 22] },
+    Heap(Box<[u8]>),
+}
+
+impl UnitKey {
+    fn new(key: &[u8]) -> UnitKey {
+        if key.len() <= 22 {
+            let mut bytes = [0; 22];
+            bytes[..key.len()].copy_from_slice(key);
+            UnitKey::Inline { length: key.len() as u8, bytes }
+        } else {
+            UnitKey::Heap(key.into())
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            UnitKey::Inline { length, bytes } => &bytes[..*length as usize],
+            UnitKey::Heap(bytes) => bytes,
+        }
+    }
+}
+
+// hashed as the bytes, so the map can be searched by a plain slice
+impl std::hash::Hash for UnitKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state)
+    }
+}
+
+impl std::borrow::Borrow<[u8]> for UnitKey {
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+/// An entry added since the last commit: a unit (by its number in `Writing::units`) in a source.
+struct Entry {
+    positions_offset: u64,
+    unit: u32,
+    source: u32,
+    frequency: u32,
+}
+
+/// What's added since the last commit. Entries go to one list, in the order sources are added (so in source order
+/// per unit); units are numbered as they first appear. Commit sorts the units and gathers each one's entries.
 struct Writing {
-    buffers: HashMap<Vec<u8>, Buffer>,
-    buffered: usize,
+    units: HashMap<UnitKey, u32>,
+    entries: Vec<Entry>,
     positions: Vec<u8>,       // positions written since the last commit
     sources_bytes: Vec<u8>,   // source records written since the last commit
     sources: Sources,
@@ -153,7 +202,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
             positions_blob,
             sources_blob,
             options,
-            writing: Mutex::new(Writing { buffers: HashMap::new(), buffered: 0, positions: Vec::new(), sources_bytes: Vec::new(), sources, meta }),
+            writing: Mutex::new(Writing { units: HashMap::new(), entries: Vec::new(), positions: Vec::new(), sources_bytes: Vec::new(), sources, meta }),
             published: RwLock::new(published),
             types: PhantomData,
         })
@@ -173,46 +222,50 @@ impl<K: Codec, U: Codec> Index<K, U> {
     /// Adds a source: its key and its units, with their positions. Returns the source's ordinal. Visible to snapshots taken
     /// after the next [`Index::commit`].
     pub fn add(&self, key: &K, units: impl IntoIterator<Item = (U, u32)>) -> u32 {
-        // every unit's dictionary key in one buffer, then grouped by key
+        // every unit's dictionary key in one buffer, then sorted so each unit's positions are together
         let mut encoded = Vec::new();
         let mut spans = Vec::new();
         for (unit, position) in units {
             let start = encoded.len();
             encoded.push(UNIT_TAG);
             unit.encode(&mut encoded);
-            spans.push((start, encoded.len(), position));
-        }
-        let mut grouped: HashMap<&[u8], Vec<u32>> = HashMap::with_capacity(spans.len());
-        for &(start, end, position) in &spans {
-            grouped.entry(&encoded[start..end]).or_default().push(position);
+            spans.push((start as u32, encoded.len() as u32, position));
         }
         let length = spans.len() as u32;
+        spans.sort_unstable_by(|a, b| encoded[a.0 as usize..a.1 as usize].cmp(&encoded[b.0 as usize..b.1 as usize]).then(a.2.cmp(&b.2)));
         let key = key.to_bytes();
         let key = key.as_slice();
-        let mut w = self.writing.lock().unwrap();
+        let mut guard = self.writing.lock().unwrap();
+        let w = &mut *guard;
         let ordinal = w.sources.push(key, length);
         varint::write(&mut w.sources_bytes, key.len() as u64);
         w.sources_bytes.extend_from_slice(key);
         varint::write(&mut w.sources_bytes, length as u64);
 
-        for (unit, mut positions) in grouped {
-            positions.sort_unstable();
-            let mut offset = 0;
+        let mut i = 0;
+        while i < spans.len() {
+            let unit = &encoded[spans[i].0 as usize..spans[i].1 as usize];
+            let end = i + spans[i..].iter().take_while(|s| &encoded[s.0 as usize..s.1 as usize] == unit).count();
+            let mut positions_offset = 0;
             if self.options.positions {
-                offset = w.meta.positions_length + w.positions.len() as u64;
+                positions_offset = w.meta.positions_length + w.positions.len() as u64;
                 let mut previous = 0;
-                for &p in &positions {
-                    varint::write(&mut w.positions, (p - previous) as u64);
-                    previous = p;
+                for s in &spans[i..end] {
+                    varint::write(&mut w.positions, (s.2 - previous) as u64);
+                    previous = s.2;
                 }
             }
-            let frequency = if self.options.frequencies { positions.len() as u32 } else { 1 };
-            let buffer = match w.buffers.get_mut(unit) {
-                Some(b) => b,
-                None => w.buffers.entry(unit.to_vec()).or_default(),
+            let frequency = if self.options.frequencies { (end - i) as u32 } else { 1 };
+            let next = w.units.len() as u32;
+            let unit = match w.units.get(unit) {
+                Some(&u) => u,
+                None => {
+                    w.units.insert(UnitKey::new(unit), next);
+                    next
+                }
             };
-            buffer.push(ordinal, frequency, offset, length);
-            w.buffered += 16;
+            w.entries.push(Entry { positions_offset, unit, source: ordinal, frequency });
+            i = end;
         }
         ordinal
     }
@@ -220,7 +273,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
     /// Bytes buffered since the last commit (postings, positions and sources).
     pub fn buffered_bytes(&self) -> usize {
         let w = self.writing.lock().unwrap();
-        w.buffered + w.positions.len() + w.sources_bytes.len()
+        w.entries.len() * std::mem::size_of::<Entry>() + w.units.len() * 32 + w.positions.len() + w.sources_bytes.len()
     }
 
     /// Makes everything added since the last commit durable and visible to new snapshots. The blobs are appended
@@ -232,27 +285,55 @@ impl<K: Codec, U: Codec> Index<K, U> {
     pub fn commit(&self) -> io::Result<()> {
         let mut guard = self.writing.lock().unwrap();
         let w = &mut *guard;
-        let mut units: Vec<(Vec<u8>, Buffer)> = w.buffers.drain().collect();
-        units.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let mut units: Vec<(UnitKey, u32)> = w.units.drain().collect();
+        units.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
+
+        // each unit's entries together, units in key order: a counting sort, which keeps each unit's in source order
+        let mut rank = vec![0u32; units.len()];
+        for (r, (_, unit)) in units.iter().enumerate() {
+            rank[*unit as usize] = r as u32;
+        }
+        let mut starts = vec![0usize; units.len() + 1];
+        for e in &w.entries {
+            starts[rank[e.unit as usize] as usize + 1] += 1;
+        }
+        for r in 0..units.len() {
+            starts[r + 1] += starts[r];
+        }
+        let mut next = starts.clone();
+        let mut gathered: Vec<(u32, u32, u64)> = vec![(0, 0, 0); w.entries.len()];
+        for e in w.entries.drain(..) {
+            let r = rank[e.unit as usize] as usize;
+            gathered[next[r]] = (e.source, e.frequency, e.positions_offset);
+            next[r] += 1;
+        }
+        drop((rank, next));
+        w.entries.shrink_to_fit();
+        w.units.shrink_to_fit();
 
         let (frequencies, positions) = (self.options.frequencies, self.options.positions);
         let mut txn = self.dict.begin_write();
-        let mut records = Vec::with_capacity(units.iter().map(|(_, b)| b.sources.len() * 3).sum::<usize>());
+        let mut records = Vec::with_capacity(gathered.len() * 3);
         let mut scratch = Vec::new();
+        let mut buffer = Buffer::default();
         let keys: Vec<&[u8]> = units.iter().map(|(k, _)| k.as_slice()).collect();
         let base = w.meta.postings_length;
         let sources = &w.sources;
         txn.put_sorted(&keys, |i, old| {
-            let buffer = &units[i].1;
+            buffer.clear();
+            for &(source, frequency, offset) in &gathered[starts[i]..starts[i + 1]] {
+                buffer.push(source, frequency, offset, sources.length(source));
+            }
             match old.map(UnitPostings::decode) {
-                None => postings::encode_unit(NO_RECORD, 0, buffer, frequencies, positions, base, &mut records, &mut scratch),
+                None => postings::encode_unit(NO_RECORD, 0, &buffer, frequencies, positions, base, &mut records, &mut scratch),
                 Some(old) if old.inline().is_some() => {
-                    let merged = postings::merge_inline(&old, buffer, frequencies, positions, |s| sources.length(s));
+                    let merged = postings::merge_inline(&old, &buffer, frequencies, positions, |s| sources.length(s));
                     postings::encode_unit(NO_RECORD, 0, &merged, frequencies, positions, base, &mut records, &mut scratch)
                 }
-                Some(old) => postings::encode_unit(old.head(), old.count, buffer, frequencies, positions, base, &mut records, &mut scratch),
+                Some(old) => postings::encode_unit(old.head(), old.count, &buffer, frequencies, positions, base, &mut records, &mut scratch),
             }
         })?;
+        drop((keys, gathered));
 
         debug_assert_eq!(self.postings_blob.len(), w.meta.postings_length);
         self.postings_blob.append(&records)?;
@@ -276,7 +357,6 @@ impl<K: Codec, U: Codec> Index<K, U> {
 
         w.positions.clear();
         w.sources_bytes.clear();
-        w.buffered = 0;
         let published = Published {
             postings: self.postings_blob.view()?,
             positions: self.positions_blob.as_ref().map(Blob::view).transpose()?,
