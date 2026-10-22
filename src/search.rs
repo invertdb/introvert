@@ -321,15 +321,18 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
             i = end;
         }
 
-        // every entry of those units, (source, unit, frequency, positions offset), grouped by source
-        let mut entries: Vec<(u32, u32, u32, u64)> = Vec::new();
+        // every entry of those units, (source, unit, frequency, positions offset), grouped by source (sorting
+        // 8-byte keys, source then where the entry is, then putting the entries in that order)
+        let mut decoded: Vec<(u32, u32, u32, u64)> = Vec::new();
         for (u, (postings, _, _)) in units.iter().enumerate() {
             let mut cursor = snapshot.postings.cursor(postings);
             while cursor.next() {
-                entries.push((cursor.source, u as u32, cursor.frequency, cursor.positions_offset()));
+                decoded.push((cursor.source, u as u32, cursor.frequency, cursor.positions_offset()));
             }
         }
-        entries.sort_unstable_by_key(|e| (e.0, e.1));
+        let mut order: Vec<u64> = decoded.iter().enumerate().map(|(i, e)| (e.0 as u64) << 32 | i as u64).collect();
+        order.sort_unstable();
+        let entries: Vec<(u32, u32, u32, u64)> = order.iter().map(|&o| decoded[o as u32 as usize]).collect();
 
         // pass 1: occurrences each source shares with the query, from postings alone; the `depth` sharing the most
         // are candidates: (shared, source, its entries)
