@@ -75,3 +75,27 @@ impl Relevance for TfIdf {
         weight * (1.0 + (unit_frequency as f64).ln())
     }
 }
+
+/// Set overlap: every unit a source shares with the query counts 1, however often it occurs and however long the
+/// source is, so a source scores the size of the intersection |Q ∩ X|. For one query that ranks as containment
+/// |Q ∩ X| / |Q| does: joinable-table search (Zhu et al., 2019, "JOSIE: Overlap Set Similarity Search for Finding
+/// Joinable Tables in Data Lakes"). With equal bounds, top-k pruning stops scoring once the k-th best overlap can't be
+/// reached by the units left.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Overlap;
+
+impl Relevance for Overlap {
+    type Norm = ();
+
+    fn weight(&self, _source_frequency: u64, _source_count: u64) -> f64 {
+        1.0
+    }
+
+    #[inline]
+    fn norm(&self, _source_length: u32, _average_length: f64) {}
+
+    #[inline]
+    fn score(&self, weight: f64, _unit_frequency: u32, _norm: ()) -> f64 {
+        weight
+    }
+}

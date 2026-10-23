@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use std::ops::Bound;
 
-use introvert::{Bm25, Clause, Codec, Index, Options, Relevance, Searcher, Snapshot, SourceSet, Match, TfIdf, Words};
+use introvert::{Bm25, Clause, Overlap, Codec, Index, Options, Relevance, Searcher, Snapshot, SourceSet, Match, TfIdf, Words};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -192,6 +192,30 @@ fn pruned_searches_return_what_scoring_everything_returns() {
     pruned_equals_exhaustive(&built, &snapshot, &Bm25::default(), &mut rng);
     pruned_equals_exhaustive(&built, &snapshot, &Bm25 { k1: 2.0, b: 0.3 }, &mut rng);
     pruned_equals_exhaustive(&built, &snapshot, &TfIdf, &mut rng);
+    pruned_equals_exhaustive(&built, &snapshot, &Overlap, &mut rng);
+}
+
+#[test]
+fn overlap_scores_the_size_of_the_intersection() {
+    // sources as sets; a query's top sources are those sharing the most of its units
+    let dir = tempfile::tempdir().unwrap();
+    let index: Index<u32, u32> = Index::open(dir.path(), Options { frequencies: false, positions: false, ..Options::default() }).unwrap();
+    let mut rng = StdRng::seed_from_u64(4);
+    let sets: Vec<std::collections::BTreeSet<u32>> = (0..500).map(|_| (0..rng.random_range(5..200)).map(|_| rng.random_range(0..2000)).collect()).collect();
+    for (key, set) in sets.iter().enumerate() {
+        index.add(&(key as u32), set.iter().map(|&u| (u, 0)));
+    }
+    index.commit().unwrap();
+    let snapshot = index.snapshot();
+    let searcher = Searcher::new(&snapshot, &Overlap);
+    for q in [3usize, 77, 401] {
+        let found = searcher.search(&Clause::should(sets[q].iter().copied()), 10);
+        let mut expected: Vec<(usize, u32)> = sets.iter().enumerate().map(|(s, set)| (sets[q].intersection(set).count(), s as u32)).collect();
+        expected.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        let got: Vec<(usize, u32)> = found.top.iter().map(|r| (r.score as usize, r.key)).collect();
+        assert_eq!(got, expected[..10].to_vec(), "query {q}");
+        assert_eq!(got[0], (sets[q].len(), q as u32), "a set overlaps itself most");
+    }
 }
 
 #[test]
