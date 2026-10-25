@@ -280,7 +280,7 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
             Match::Unit(u) => self.snapshot.unit(u).into_iter().collect(),
             Match::Prefix(u) => self.snapshot.encoded_prefix(u).take(self.max_expansion).map(|(_, p)| p).collect(),
             Match::Range(start, end) => self.snapshot.encoded_units((start.as_ref(), end.as_ref())).take(self.max_expansion).map(|(_, p)| p).collect(),
-            Match::Any(units) => units.iter().filter_map(|u| self.snapshot.unit(u)).collect(),
+            Match::Any(units) => self.snapshot.units_many(units).into_iter().flatten().collect(),
             Match::Postings(parts) => parts.clone(),
         }
     }
@@ -307,18 +307,24 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
         // per distinct unit found: its query positions (a range of `query_positions`)
         let mut units: Vec<(UnitPostings, usize, usize)> = Vec::new();
         let mut query_positions: Vec<i64> = Vec::with_capacity(spans.len());
+        // each distinct unit's run of spans, then all their postings in one batch
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         while i < spans.len() {
             let key = &encoded[spans[i].0..spans[i].1];
             let end = i + spans[i..].iter().take_while(|s| &encoded[s.0..s.1] == key).count();
-            if let Some(postings) = snapshot.encoded_unit(key)
+            runs.push((i, end));
+            i = end;
+        }
+        let keys: Vec<&[u8]> = runs.iter().map(|&(i, _)| &encoded[spans[i].0..spans[i].1]).collect();
+        for (&(i, end), found) in runs.iter().zip(snapshot.encoded_units_many(&keys)) {
+            if let Some(postings) = found
                 && (max_source_frequency == 0 || postings.count <= max_source_frequency)
             {
                 let first = query_positions.len();
                 query_positions.extend(spans[i..end].iter().map(|s| s.2));
                 units.push((postings, first, query_positions.len()));
             }
-            i = end;
         }
 
         // every entry of those units, (source, unit, frequency, positions offset), grouped by source (sorting

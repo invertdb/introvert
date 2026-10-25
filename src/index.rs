@@ -443,6 +443,28 @@ impl<K: Codec, U: Codec> Snapshot<K, U> {
         self.dict.get(key).map(|v| UnitPostings::decode(&v))
     }
 
+    /// Many units' postings at once, by their dictionary keys (looked up together, so their waits for memory
+    /// overlap; sorted keys also share pages).
+    pub(crate) fn encoded_units_many(&self, keys: &[&[u8]]) -> Vec<Option<UnitPostings>> {
+        self.dict.get_many(keys).into_iter().map(|v| v.map(|v| UnitPostings::decode(&v))).collect()
+    }
+
+    /// Many units' postings at once (see [`Snapshot::unit`]).
+    pub fn units_many(&self, units: &[U]) -> Vec<Option<UnitPostings>> {
+        let mut encoded = Vec::new();
+        let mut ends = Vec::with_capacity(units.len());
+        for unit in units {
+            self.encode_unit(unit, &mut encoded);
+            ends.push(encoded.len());
+        }
+        let keys: Vec<&[u8]> = ends.iter().scan(0, |start, &end| {
+            let key = &encoded[*start..end];
+            *start = end;
+            Some(key)
+        }).collect();
+        self.encoded_units_many(&keys)
+    }
+
     /// Units in a range, in order, with their postings.
     pub fn units(&self, range: impl RangeBounds<U>) -> impl Iterator<Item = (U, UnitPostings)> + '_ {
         self.encoded_units(range).map(|(k, p)| (U::decode(&k[1..]), p))
