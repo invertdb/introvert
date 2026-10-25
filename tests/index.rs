@@ -514,3 +514,35 @@ fn units_too_long_for_the_dictionary_are_left_out_and_the_commit_succeeds() {
     assert_eq!(snapshot.unit(&longest).unwrap().count, 1);
     assert!(snapshot.unit(&too_long).is_none());
 }
+
+#[test]
+fn a_compacted_index_answers_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = larry::Store::open(dir.path()).unwrap();
+    let vocabulary: Vec<String> = (0..5000).map(|i| format!("unit{i}")).collect();
+    {
+        let index: Index<String, String> = Index::open_in(&store, Options::default()).unwrap();
+        for s in 0..20_000u32 {
+            let units = (0..6).map(|j| (vocabulary[((s * 31 + j * 977) % 5000) as usize].clone(), j));
+            index.add(&format!("s{s}"), units);
+            if s % 2000 == 1999 {
+                index.commit().unwrap();
+            }
+        }
+        index.commit().unwrap();
+    }
+    let before: Vec<(String, u64)> = {
+        let index: Index<String, String> = Index::open_in(&store, Options::default()).unwrap();
+        index.snapshot().units(..).map(|(u, p)| (u, p.count)).collect()
+    };
+    let size = |s: &larry::Store| std::fs::metadata(s.path("units.db").unwrap()).unwrap().len();
+    let old = size(&store);
+    Index::<String, String>::compact_in(&store).unwrap();
+    assert!(size(&store) < old, "compacted {} from {old}", size(&store));
+    let index: Index<String, String> = Index::open_in(&store, Options::default()).unwrap();
+    let snapshot = index.snapshot();
+    assert_eq!(snapshot.units(..).map(|(u, p)| (u, p.count)).collect::<Vec<_>>(), before);
+    assert_eq!(snapshot.source_count(), 20_000);
+    let found = snapshot.unit(&vocabulary[42]).unwrap();
+    assert_eq!(snapshot.postings.decode(&found).len() as u64, found.count);
+}

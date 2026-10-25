@@ -214,6 +214,15 @@ impl<K: Codec, U: Codec> Index<K, U> {
         })
     }
 
+    /// Compacts the dictionary of the closed index in `store` (see b-positive's `Db::compact_to`): an index committed
+    /// in parts keeps the dictionary pages each commit rewrote, and its file never shrinks. Writes the copy beside
+    /// it, then renames it over the dictionary, so a crash leaves one or the other whole.
+    pub fn compact_in(store: &Store) -> io::Result<()> {
+        let (path, copy) = (store.path("units.db")?, store.path("units.db.compact")?);
+        Db::open(&path, b_positive::Options::default())?.compact_to(&copy)?;
+        std::fs::rename(&copy, &path)
+    }
+
     pub fn options(&self) -> Options {
         self.options
     }
