@@ -27,6 +27,10 @@ use crate::varint;
 const META_KEY: &[u8] = &[0];
 const UNIT_TAG: u8 = 1;
 
+/// The longest unit encoding the dictionary takes (its keys are the tag, then the encoding). [`Index::add`] leaves out
+/// longer units and counts them ([`Index::dropped_units`]).
+pub const MAX_UNIT_BYTES: usize = b_positive::page::MAX_KEY - 1;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// Record how often a unit occurs in a source (else every frequency reads 1).
@@ -122,6 +126,8 @@ struct Writing {
     sources_bytes: Vec<u8>,   // source records written since the last commit
     sources: Sources,
     meta: Meta,
+    /// Units left out by `add` since the index was opened, for an encoding longer than MAX_UNIT_BYTES.
+    dropped: u64,
 }
 
 struct Published {
@@ -202,7 +208,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
             positions_blob,
             sources_blob,
             options,
-            writing: Mutex::new(Writing { units: HashMap::new(), entries: Vec::new(), positions: Vec::new(), sources_bytes: Vec::new(), sources, meta }),
+            writing: Mutex::new(Writing { units: HashMap::new(), entries: Vec::new(), positions: Vec::new(), sources_bytes: Vec::new(), sources, meta, dropped: 0 }),
             published: RwLock::new(published),
             types: PhantomData,
         })
@@ -220,15 +226,22 @@ impl<K: Codec, U: Codec> Index<K, U> {
     }
 
     /// Adds a source: its key and its units, with their positions. Returns the source's ordinal. Visible to snapshots taken
-    /// after the next [`Index::commit`].
+    /// after the next [`Index::commit`]. A unit whose encoding is longer than [`MAX_UNIT_BYTES`] is left out (and
+    /// counted in [`Index::dropped_units`]): it can't be a dictionary key, and taking it would fail the commit.
     pub fn add(&self, key: &K, units: impl IntoIterator<Item = (U, u32)>) -> u32 {
         // every unit's dictionary key in one buffer, then sorted so each unit's positions are together
         let mut encoded = Vec::new();
         let mut spans = Vec::new();
+        let mut dropped = 0;
         for (unit, position) in units {
             let start = encoded.len();
             encoded.push(UNIT_TAG);
             unit.encode(&mut encoded);
+            if encoded.len() - start > MAX_UNIT_BYTES + 1 {
+                encoded.truncate(start);
+                dropped += 1;
+                continue;
+            }
             spans.push((start as u32, encoded.len() as u32, position));
         }
         let length = spans.len() as u32;
@@ -237,6 +250,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
         let key = key.as_slice();
         let mut guard = self.writing.lock().unwrap();
         let w = &mut *guard;
+        w.dropped += dropped;
         let ordinal = w.sources.push(key, length);
         varint::write(&mut w.sources_bytes, key.len() as u64);
         w.sources_bytes.extend_from_slice(key);
@@ -268,6 +282,11 @@ impl<K: Codec, U: Codec> Index<K, U> {
             i = end;
         }
         ordinal
+    }
+
+    /// Units [`Index::add`] has left out since the index was opened, for encodings longer than [`MAX_UNIT_BYTES`].
+    pub fn dropped_units(&self) -> u64 {
+        self.writing.lock().unwrap().dropped
     }
 
     /// Bytes buffered since the last commit (postings, positions and sources).

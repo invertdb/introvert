@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use std::ops::Bound;
 
-use introvert::{Bm25, Clause, Overlap, Codec, Index, Options, Relevance, Searcher, Snapshot, SourceSet, Match, TfIdf, Words};
+use introvert::{Bm25, Clause, Overlap, Codec, Index, Options, Relevance, Searcher, Snapshot, SourceSet, Match, TfIdf, Words, MAX_UNIT_BYTES};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -495,4 +495,22 @@ fn intersecting_a_small_set_with_a_large_one() {
         let found: Vec<u32> = searcher.matching(&c).iter().collect();
         assert_eq!(found, have(rare).difference(&have(common)).copied().collect::<Vec<_>>(), "{rare} without {common}");
     }
+}
+
+#[test]
+fn units_too_long_for_the_dictionary_are_left_out_and_the_commit_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let index: Index<String, String> = Index::open(dir.path(), Options::default()).unwrap();
+    let longest = "a".repeat(MAX_UNIT_BYTES);
+    let too_long = "b".repeat(MAX_UNIT_BYTES + 1);
+    let units = [("short".to_string(), 0), (too_long.clone(), 1), (longest.clone(), 2), (too_long.clone(), 3)];
+    index.add(&"s0".to_string(), units);
+    index.add(&"s1".to_string(), [("short".to_string(), 0)]);
+    index.commit().unwrap();
+    assert_eq!(index.dropped_units(), 2);
+    let snapshot = index.snapshot();
+    assert_eq!(snapshot.source_length(0), 2, "the units kept");
+    assert_eq!(snapshot.unit(&"short".to_string()).unwrap().count, 2);
+    assert_eq!(snapshot.unit(&longest).unwrap().count, 1);
+    assert!(snapshot.unit(&too_long).is_none());
 }
