@@ -176,6 +176,8 @@ const CURSOR_PARTS: usize = 16;
 pub struct Searcher<'s, K, U, R> {
     snapshot: &'s Snapshot<K, U>,
     relevance: &'s R,
+    /// Sources no query returns or counts (deleted ones).
+    excluded: Option<&'s SourceSet>,
     max_expansion: usize,
     bounds: RefCell<HashMap<UnitPostings, f64>>,
 }
@@ -261,7 +263,19 @@ struct Query<'q, 's, K, U, R> {
 
 impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
     pub fn new(snapshot: &'s Snapshot<K, U>, relevance: &'s R) -> Self {
-        Searcher { snapshot, relevance, max_expansion: DEFAULT_MAX_EXPANSION, bounds: RefCell::new(HashMap::new()) }
+        Searcher { snapshot, relevance, excluded: None, max_expansion: DEFAULT_MAX_EXPANSION, bounds: RefCell::new(HashMap::new()) }
+    }
+
+    /// Leaves `sources` out of every answer and count (as if they weren't in the index): a collection's deleted
+    /// sources. Ranked answers stay exact: they're left out before the top is chosen.
+    pub fn without(mut self, sources: &'s SourceSet) -> Self {
+        self.excluded = (!sources.is_empty()).then_some(sources);
+        self
+    }
+
+    #[inline]
+    fn is_excluded(&self, source: u32) -> bool {
+        self.excluded.is_some_and(|e| source < e.capacity() && e.contains(source))
     }
 
     /// The most units a prefix or range match expands to (the first in order).
@@ -353,7 +367,9 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
                 shared += entries[end].2 as u64 * (last - first) as u64;
                 end += 1;
             }
-            candidates.push((shared, source, start, end));
+            if !self.is_excluded(source) {
+                candidates.push((shared, source, start, end));
+            }
             start = end;
         }
         let rank = |a: &(u64, u32, usize, usize), b: &(u64, u32, usize, usize)| b.0.cmp(&a.0).then(a.1.cmp(&b.1));
@@ -403,7 +419,11 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
 
     /// The sources matching a clause, unranked.
     pub fn matching(&self, clause: &Clause<U>) -> SourceSet {
-        Query::new(self).evaluate(clause)
+        let mut matches = Query::new(self).evaluate(clause);
+        if let Some(excluded) = self.excluded {
+            matches.and_not(excluded);
+        }
+        matches
     }
 
     /// The best `top` sources for a clause, best first.
@@ -428,7 +448,10 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
     /// Scores every matching source; counts them exactly.
     pub fn search_all(&self, clause: &Clause<U>, top: usize) -> SearchResults<K> {
         let mut query = Query::new(self);
-        let matches = query.evaluate(clause);
+        let mut matches = query.evaluate(clause);
+        if let Some(excluded) = self.excluded {
+            matches.and_not(excluded);
+        }
         let n = self.snapshot.source_count() as usize;
         let mut scores = vec![0.0f64; n];
         let mut hits = vec![0u32; n];
@@ -605,6 +628,9 @@ impl<'s, K: Codec, U: Codec + Clone, R: Relevance> Searcher<'s, K, U, R> {
             for &u in &orders {
                 score += contributions[u];
                 hits += frequencies[u];
+            }
+            if self.is_excluded(candidate) {
+                continue;
             }
             scored += 1;
             best.offer(Scored { source: candidate, score, hits });

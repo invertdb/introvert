@@ -546,3 +546,62 @@ fn a_compacted_index_answers_the_same() {
     let found = snapshot.unit(&vocabulary[42]).unwrap();
     assert_eq!(snapshot.postings.decode(&found).len() as u64, found.count);
 }
+
+#[test]
+fn excluded_sources_are_left_out_before_the_top_is_chosen() {
+    let built = build(11);
+    let snapshot = built.index.snapshot();
+    let mut rng = StdRng::seed_from_u64(12);
+    // every third source and a run of 2,000, as a collection's deleted sources
+    let mut excluded = SourceSet::new(snapshot.source_count());
+    for s in (0..snapshot.source_count()).filter(|s| s % 3 == 0 || (5000..7000).contains(s)) {
+        excluded.insert(s);
+    }
+    let relevance = Bm25::default();
+    let all = Searcher::new(&snapshot, &relevance);
+    let live = Searcher::new(&snapshot, &relevance).without(&excluded);
+    for top in [1usize, 10, 100] {
+        for q in 0..100 {
+            let count = rng.random_range(1..6);
+            let units: Vec<String> = (0..count).map(|_| built.vocabulary[(3000.0 * rng.random::<f64>().powi(2)) as usize].clone()).collect();
+            let clause = Clause::should(units);
+            // the reference: everything scored, the excluded removed, then the top taken
+            let every = all.search_all(&clause, snapshot.source_count() as usize);
+            let expected: Vec<_> = every.top.iter().filter(|r| !excluded.contains(r.source)).take(top).map(|r| (r.source, r.score)).collect();
+            let exhaustive = live.search_all(&clause, top);
+            let pruned = live.search(&clause, top);
+            assert_eq!(exhaustive.top.iter().map(|r| (r.source, r.score)).collect::<Vec<_>>(), expected, "query {q}, top {top}");
+            assert_eq!(pruned.top.iter().map(|r| (r.source, r.score)).collect::<Vec<_>>(), expected, "query {q}, top {top} (pruned)");
+            assert_eq!(exhaustive.count as usize, every.top.iter().filter(|r| !excluded.contains(r.source)).count());
+            assert!(live.matching(&clause).iter().all(|s| !excluded.contains(s)));
+        }
+    }
+    // an empty set excludes nothing
+    let none = SourceSet::new(snapshot.source_count());
+    let clause = Clause::should(built.vocabulary[..3].to_vec());
+    assert_eq!(Searcher::new(&snapshot, &relevance).without(&none).search(&clause, 10).top.len(), all.search(&clause, 10).top.len());
+}
+
+#[test]
+fn alignment_leaves_out_excluded_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let index: Index<u32, u32> = Index::open(dir.path(), Options::default()).unwrap();
+    let mut rng = StdRng::seed_from_u64(8);
+    let sequences: Vec<Vec<u32>> = (0..200).map(|_| (0..500).map(|_| rng.random_range(0..5000)).collect()).collect();
+    for (key, sequence) in sequences.iter().enumerate() {
+        index.add(&(key as u32), sequence.iter().enumerate().map(|(p, &u)| (u, p as u32)));
+    }
+    // source 200 is a copy of source 7
+    index.add(&200, sequences[7].iter().enumerate().map(|(p, &u)| (u, p as u32)));
+    index.commit().unwrap();
+    let snapshot = index.snapshot();
+    let relevance = TfIdf;
+    let query: Vec<(u32, u32)> = (0..60).map(|i| (sequences[7][100 + i], i as u32)).collect();
+    let found = Searcher::new(&snapshot, &relevance).align(&query, 2, 1, 100, 0);
+    assert_eq!(found.iter().map(|a| a.key).collect::<Vec<_>>(), [7, 200]);
+    let mut excluded = SourceSet::new(snapshot.source_count());
+    excluded.insert(7);
+    let found = Searcher::new(&snapshot, &relevance).without(&excluded).align(&query, 2, 1, 100, 0);
+    assert_eq!(found[0].key, 200);
+    assert!(found.len() < 2 || found[1].count < 10, "{found:?}");
+}
