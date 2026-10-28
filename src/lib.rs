@@ -16,6 +16,11 @@
 //! frame of reference (Goldstein, Ramakrishnan and Shaft, 1998); top-k by MaxScore (Turtle and Flood, 1995) with
 //! pre-computed impacts (Anh and Moffat, 2006) and block maxima (Ding and Suel, 2011); units ordered by normalized
 //! keys (Graefe, 2011). Full references are in the README.
+//!
+//! **Telemetry:** spans for opening, committing (the dictionary and the sync inside) and compacting (`tracing`), and
+//! the metrics `invertdb.index.commit.duration`, `invertdb.index.committed` and `invertdb.index.units.dropped` (the
+//! `opentelemetry` API). Nothing per lookup or per search; both do nothing until the program installs a subscriber
+//! and a meter provider.
 
 pub mod bitpack;
 pub mod codec;

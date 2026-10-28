@@ -11,10 +11,13 @@ use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 use std::io;
 use std::path::Path;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::Instant;
 
 use b_positive::{Db, Durability, ReadTxn};
 use larry::{Blob, Store, View};
+use opentelemetry::global;
+use opentelemetry::metrics::{Counter, Histogram};
 
 use crate::codec::Codec;
 use crate::inverter::Inverter;
@@ -148,6 +151,30 @@ pub struct Index<K, U> {
     types: PhantomData<fn() -> (K, U)>,
 }
 
+/// The index's metrics, made on first use (after a service installs its meter provider; no-ops until then).
+struct Instruments {
+    commit: Histogram<f64>,
+    committed: Counter<u64>,
+    dropped: Counter<u64>,
+}
+
+fn instruments() -> &'static Instruments {
+    static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
+    INSTRUMENTS.get_or_init(|| {
+        let meter = global::meter("introvert");
+        Instruments {
+            commit: meter
+                .f64_histogram("invertdb.index.commit.duration")
+                .with_unit("s")
+                .with_description("Time to commit an index: the dictionary, the blobs, and syncing them.")
+                .with_boundaries(vec![0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0])
+                .build(),
+            committed: meter.u64_counter("invertdb.index.committed").with_unit("{source}").with_description("Sources committed to indexes.").build(),
+            dropped: meter.u64_counter("invertdb.index.units.dropped").with_unit("{unit}").with_description("Units left out for encodings longer than the limit.").build(),
+        }
+    })
+}
+
 impl<K: Codec, U: Codec> Index<K, U> {
     /// Opens (or creates) an index in a directory of its own.
     pub fn open(directory: impl AsRef<Path>, options: Options) -> io::Result<Self> {
@@ -156,6 +183,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
 
     /// Opens (or creates) an index in a store of its own.
     pub fn open_in(store: &Store, options: Options) -> io::Result<Self> {
+        let _span = tracing::info_span!("index.open").entered();
         let dict = Db::open(store.path("units.db")?, b_positive::Options { durability: options.durability })?;
         let postings_blob = store.blob("postings.dat")?;
         let meta = dict.begin_read().get(META_KEY).map(|m| Meta::decode(&m)).unwrap_or_default();
@@ -218,6 +246,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
     /// in parts keeps the dictionary pages each commit rewrote, and its file never shrinks. Writes the copy beside
     /// it, then renames it over the dictionary, so a crash leaves one or the other whole.
     pub fn compact_in(store: &Store) -> io::Result<()> {
+        let _span = tracing::info_span!("index.compact").entered();
         let (path, copy) = (store.path("units.db")?, store.path("units.db.compact")?);
         Db::open(&path, b_positive::Options::default())?.compact_to(&copy)?;
         std::fs::rename(&copy, &path)
@@ -260,6 +289,9 @@ impl<K: Codec, U: Codec> Index<K, U> {
         let mut guard = self.writing.lock().unwrap();
         let w = &mut *guard;
         w.dropped += dropped;
+        if dropped > 0 {
+            instruments().dropped.add(dropped, &[]);
+        }
         let ordinal = w.sources.push(key, length);
         varint::write(&mut w.sources_bytes, key.len() as u64);
         w.sources_bytes.extend_from_slice(key);
@@ -311,8 +343,14 @@ impl<K: Codec, U: Codec> Index<K, U> {
     /// The units go into the dictionary in one sorted pass. A unit with no record whose entries fit stays inline in
     /// its value (with any it had inline before); past that, its entries move to a record, and later ones chain.
     pub fn commit(&self) -> io::Result<()> {
+        let span = tracing::info_span!("index.commit", units = tracing::field::Empty, entries = tracing::field::Empty, sources = tracing::field::Empty, postings_bytes = tracing::field::Empty).entered();
+        let start = Instant::now();
         let mut guard = self.writing.lock().unwrap();
         let w = &mut *guard;
+        let added = w.sources.count() - w.meta.sources;
+        span.record("units", w.units.len());
+        span.record("entries", w.entries.len());
+        span.record("sources", added);
         let mut units: Vec<(UnitKey, u32)> = w.units.drain().collect();
         units.sort_unstable_by(|a, b| a.0.as_slice().cmp(b.0.as_slice()));
 
@@ -340,6 +378,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
         w.units.shrink_to_fit();
 
         let (frequencies, positions) = (self.options.frequencies, self.options.positions);
+        let dictionary = tracing::info_span!("index.commit.dictionary").entered();
         let mut txn = self.dict.begin_write();
         let mut records = Vec::with_capacity(gathered.len() * 3);
         let mut scratch = Vec::new();
@@ -362,6 +401,8 @@ impl<K: Codec, U: Codec> Index<K, U> {
             }
         })?;
         drop((keys, gathered));
+        drop(dictionary);
+        span.record("postings_bytes", records.len());
 
         debug_assert_eq!(self.postings_blob.len(), w.meta.postings_length);
         self.postings_blob.append(&records)?;
@@ -373,6 +414,7 @@ impl<K: Codec, U: Codec> Index<K, U> {
         self.sources_blob.append(&w.sources_bytes)?;
         w.meta.sources_length += w.sources_bytes.len() as u64;
         if self.options.durability == Durability::Full {
+            let _sync = tracing::info_span!("index.commit.sync").entered();
             self.postings_blob.sync()?;
             if let Some(blob) = &self.positions_blob {
                 blob.sync()?;
@@ -391,6 +433,9 @@ impl<K: Codec, U: Codec> Index<K, U> {
             sources: w.sources.clone(),
         };
         *self.published.write().unwrap() = published;
+        let instruments = instruments();
+        instruments.commit.record(start.elapsed().as_secs_f64(), &[]);
+        instruments.committed.add(added as u64, &[]);
         Ok(())
     }
 
