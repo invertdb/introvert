@@ -119,4 +119,11 @@ Each technique is cited where it is used and listed under [References](#referenc
   *Information Processing & Management* 31(6).
 - Zobel, J., and Moffat, A. (2006). Inverted files for text search engines. *ACM Computing Surveys* 38(2).
 
-Repos are checked out side by side (`../b-positive`, `../larry`).
+b-positive and larry come from GitHub. To build against local checkouts beside this one, `[patch]` their URLs to
+paths in a `.cargo/config.toml` above them.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this crate by you, as
+defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

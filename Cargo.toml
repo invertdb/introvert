@@ -2,10 +2,13 @@
 name = "introvert"
 version = "0.1.0"
 edition = "2024"
+description = "A generic inverted index: any source inverted into any unit, on b-positive"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/invertdb/introvert"
 
 [dependencies]
-b-positive = { version = "0.1.0", path = "../b-positive" }
-larry = { version = "0.1.0", path = "../larry" }
+b-positive = { version = "0.1.0", git = "https://github.com/invertdb/b-positive" }
+larry = { version = "0.1.0", git = "https://github.com/invertdb/larry" }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 unicode-general-category = "1.1.0"
