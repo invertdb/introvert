@@ -5,6 +5,7 @@ version = 4
 [[package]]
 name = "b-positive"
 version = "0.1.0"
+source = "git+https://github.com/invertdb/b-positive#5eafed47cc1093f1cbe335e8d6b65ad6cebf2084"
 dependencies = [
  "crc32fast",
  "memmap2",
@@ -136,6 +137,7 @@ dependencies = [
 [[package]]
 name = "larry"
 version = "0.1.0"
+source = "git+https://github.com/invertdb/larry#2b76a7b48f26c19d0f45f767ac61f95801e38718"
 dependencies = [
  "memmap2",
  "opentelemetry",
