@@ -8,7 +8,7 @@ repository = "https://github.com/invertdb/introvert"
 
 [dependencies]
 b-positive = { version = "0.1.0", git = "https://github.com/invertdb/b-positive" }
-larry = { version = "0.1.0", git = "https://github.com/invertdb/larry" }
+larry = { package = "invertdb-larry", version = "0.1.0", git = "https://github.com/invertdb/larry" }
 opentelemetry = { version = "0.33.1", default-features = false, features = ["metrics"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
 unicode-general-category = "1.1.0"
